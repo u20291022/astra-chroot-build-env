@@ -1,0 +1,545 @@
+#!/bin/bash
+# install-binary-from-build-env — установить собранное в build-env на хост.
+# https://github.com/u20291022/astra-chroot-build-env
+set -euo pipefail
+
+VERSION=1.0.0
+
+die()  { echo "install-binary-from-build-env: $*" >&2; exit 1; }
+warn() { echo "  ! $*" >&2; }
+
+OPT=${BUILD_ENV_OPT:-$HOME/.local/opt/buildenv}
+BIN=${BUILD_ENV_BIN:-$HOME/.local/bin}
+APPS=${BUILD_ENV_APPS:-$HOME/.local/share/applications}
+CHROOT=${BUILD_ENV_CHROOT:-}
+
+usage() {
+  cat <<'EOF'
+install-binary-from-build-env — установка программы из build-env на хост
+
+ИСПОЛЬЗОВАНИЕ
+  install-binary-from-build-env [параметры] ФАЙЛ...        отдельные бинарники
+  install-binary-from-build-env [параметры] --tree ПАПКА   программа с bin/, lib/, share/...
+  install-binary-from-build-env --list                     что установлено
+  install-binary-from-build-env --remove ИМЯ               удалить
+
+  Установка работает внутри activate-build-env, --list и --remove работают и на хосте.
+
+ПАРАМЕТРЫ
+  -n, --name ИМЯ       имя приложения (по умолчанию: имя первого файла или папки)
+  -t, --tree ПАПКА     установить дерево целиком, пропатчив все ELF-файлы внутри
+  -L, --link ПУТЬ      что вывести в ~/.local/bin (путь внутри дерева, можно повторять;
+                       по умолчанию: всё исполняемое из bin/)
+  -l, --lib ФАЙЛ       добавить библиотеку, которую программа грузит через dlopen
+  -e, --env VAR=ЗНАЧ   переменная в обёртке запуска (можно повторять);
+                       @CHROOT@ заменяется путём к chroot, @APP@ папкой приложения
+      --gpu            обёртка с драйверами Mesa/Vulkan из chroot
+      --strip          удалить отладочную информацию (бинарник станет в разы меньше)
+      --no-link        не создавать ссылки в ~/.local/bin
+      --desktop        создать ярлык в меню приложений
+                       (для --tree ярлыки из share/applications ставятся автоматически)
+      --no-desktop     не создавать ярлыки
+      --terminal       ярлык открывает программу в терминале (для консольных утилит)
+      --icon ФАЙЛ      иконка для ярлыка
+  -f, --force          заменить существующий чужой файл в ~/.local/bin
+
+КУДА СТАВИТСЯ
+  ~/.local/opt/buildenv/ИМЯ   файлы программы
+  ~/.local/bin/               ссылки или обёртки для запуска
+  ~/.local/share/applications ярлыки для меню (rofi, KDE, Fly)
+
+КОГДА ОБЫЧНОЙ УСТАНОВКИ МАЛО
+
+  Сборка не находит заголовки или библиотеки (fatal error: foo.h, cannot find -lfoo)
+    Поставьте -dev пакет в chroot:
+      exit
+      activate-build-env --root apt install libfoo-dev
+    Какой пакет нужен:  activate-build-env --root sh -c 'apt install -y apt-file && apt-file update && apt-file search foo.h'
+
+  Go или Rust без C-зависимостей
+    Соберите статически, тогда патчить нечего:
+      CGO_ENABLED=0 go build
+      rustup target add x86_64-unknown-linux-musl
+      cargo build --release --target x86_64-unknown-linux-musl
+
+  Программа с каталогами bin/, share/, libexec/ (темы, иконки, вспомогательные бинарники)
+    Соберите с префиксом итоговой папки, установите во временную и поставьте деревом:
+      make install PREFIX="$BUILD_ENV_OPT/ИМЯ" DESTDIR="$PWD/stage"
+      cmake -B build -DCMAKE_INSTALL_PREFIX="$BUILD_ENV_OPT/ИМЯ" && cmake --build build
+        DESTDIR="$PWD/stage" cmake --install build
+      meson setup build --prefix="$BUILD_ENV_OPT/ИМЯ" && ninja -C build
+        DESTDIR="$PWD/stage" meson install -C build
+      install-binary-from-build-env --tree "stage$BUILD_ENV_OPT/ИМЯ" --name ИМЯ
+    С таким префиксом программа найдёт свои данные там, куда будет установлена.
+
+  Программа ищет модули или данные по встроенному пути
+    Признаки: «cannot open shared object», «module not found», пропали иконки,
+    темы, кодировки. Посмотреть, что она не нашла:
+      strace -f -e trace=openat ПРОГРАММА 2>&1 | grep ENOENT
+    Дальше по ситуации:
+      --lib ФАЙЛ                                       одна библиотека через dlopen
+      --env GCONV_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/gconv     iconv, кодировки
+      --env GIO_MODULE_DIR=@CHROOT@/usr/lib/x86_64-linux-gnu/gio/modules
+      --env GTK_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/gtk-3.0     плагины GTK
+      --env QT_PLUGIN_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/qt5/plugins
+      --env XDG_DATA_DIRS=@CHROOT@/usr/share:/usr/local/share:/usr/share
+    Для GTK/Qt-приложений проще собрать через Flatpak или AppImage: там это уже решено.
+
+  Переменные обёртки попадают в дочерние процессы
+    --gpu и --env наследуют программы, которые запускает приложение
+    (например, терминал внутри редактора). Для хостовых программ опасны GCONV_PATH
+    и PYTHONHOME. Сбросьте их в ~/.bashrc, если работаете во встроенном терминале:
+      unset GCONV_PATH PYTHONHOME VK_ICD_FILENAMES LIBGL_DRIVERS_PATH NODEVICE_SELECT
+
+  Python, Node и другие скриптовые программы
+    Это не бинарники, они запустятся хостовым интерпретатором. На хосте удобнее
+    uv (сам скачивает свежий Python) или pipx. Если нужен Python именно из chroot:
+      install-binary-from-build-env /usr/bin/python3.11 --name python311 \
+        --env PYTHONHOME=@CHROOT@/usr
+
+  sudo спрашивает пароль при каждом activate-build-env
+    Это намеренно: activate-build-env --root даёт root-оболочку, поэтому правило
+    NOPASSWD для скрипта фактически означает root без пароля. Пароль кэшируется sudo
+    на несколько минут, этого обычно хватает.
+
+  Ярлык не появился в меню
+    rofi читает ярлыки сразу. KDE: kbuildsycoca5. Fly: перезайдите в сеанс.
+EOF
+}
+
+is_elf() { [ "$(head -c4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 7f454c46 ]; }
+
+kind() {  # exe | lib | static | other
+  is_elf "$1" || { echo other; return; }
+  if [ -n "$(patchelf --print-interpreter "$1" 2>/dev/null)" ]; then echo exe
+  elif [ -n "$(patchelf --print-needed "$1" 2>/dev/null)" ]; then echo lib
+  else echo static
+  fi
+}
+
+check_name() { case "$1" in ""|*/*|.*) die "некорректное имя: '$1'" ;; esac; }
+
+list_apps() {
+  local d found=0
+  for d in "$OPT"/*/; do
+    [ -d "$d" ] || continue
+    found=1
+    echo "$(basename "$d")  ($(du -sh "$d" | cut -f1))"
+    [ -f "$d/.links" ] && sed 's/^/    → /' "$d/.links"
+  done
+  [ "$found" = 1 ] || echo "Ничего не установлено."
+}
+
+remove_app() {
+  check_name "$1"
+  local d=$OPT/$1 l
+  [ -d "$d" ] || die "приложение '$1' не найдено"
+  if [ -f "$d/.links" ]; then
+    while IFS= read -r l; do
+      case "$(readlink "$l" 2>/dev/null)" in
+        "$d"/*) rm -f "$l"; echo "  удалено $l" ;;
+        *) if grep -qs -e "BUILD_ENV_WRAPPER $d/" -e "BUILD_ENV_DESKTOP $d/" "$l"; then
+             rm -f "$l"; echo "  удалено $l"
+           fi ;;
+      esac
+    done < "$d/.links"
+  fi
+  rm -rf "$d"
+  echo "Удалено: $1"
+}
+
+NAME=""; TREE=""; GPU=0; STRIP=0; LINK=1; FORCE=0; LINKED=0
+DESKTOP=auto; TERMINAL=0; ICON=""; FIRST_EXEC=""; DESKTOPS=0
+FILES=(); EXTRA_LIBS=(); LINKS=(); ENVS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--name)  NAME=${2:?"--name требует значение"}; shift 2 ;;
+    -t|--tree)  TREE=${2:?"--tree требует папку"}; shift 2 ;;
+    -L|--link)  LINKS+=("${2:?"--link требует путь"}"); shift 2 ;;
+    -l|--lib)   EXTRA_LIBS+=("${2:?"--lib требует файл"}"); shift 2 ;;
+    -e|--env)   ENVS+=("${2:?"--env требует VAR=ЗНАЧЕНИЕ"}"); shift 2 ;;
+    --gpu)      GPU=1; shift ;;
+    --strip)    STRIP=1; shift ;;
+    --no-link)  LINK=0; shift ;;
+    -f|--force) FORCE=1; shift ;;
+    --desktop)    DESKTOP=1; shift ;;
+    --no-desktop) DESKTOP=0; shift ;;
+    --terminal)   TERMINAL=1; shift ;;
+    --icon)       ICON=${2:?"--icon требует файл"}; shift 2 ;;
+    -V|--version) echo "install-binary-from-build-env $VERSION"; exit 0 ;;
+    --list)     list_apps; exit 0 ;;
+    --remove)   remove_app "${2:-}"; exit 0 ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         die "неизвестный параметр: $1 (см. --help)" ;;
+    *)          FILES+=("$1"); shift ;;
+  esac
+done
+
+[ -n "${BUILD_ENV:-}" ] || die "установка работает только внутри activate-build-env (на хосте доступны --list и --remove)"
+[ "$(id -u)" -ne 0 ] || die "не устанавливайте от root: выйдите из activate-build-env --root и войдите без --root"
+[ -z "$ICON" ] || [ -f "$ICON" ] || die "нет файла иконки: $ICON"
+
+if [ -n "$TREE" ]; then
+  [ ${#FILES[@]} -eq 0 ] || die "--tree нельзя сочетать с отдельными файлами"
+  [ -d "$TREE" ] || die "нет папки: $TREE"
+  TREE=$(readlink -f "$TREE")
+  case "$OPT/" in "$TREE"/*) die "папка $TREE содержит $OPT" ;; esac
+  NAME=${NAME:-$(basename "$TREE")}
+else
+  [ ${#FILES[@]} -gt 0 ] || { usage; exit 1; }
+  [ ${#LINKS[@]} -eq 0 ] || die "--link используется только вместе с --tree"
+  NAME=${NAME:-$(basename "${FILES[0]}")}
+fi
+check_name "$NAME"
+for f in "${FILES[@]}" "${EXTRA_LIBS[@]}"; do [ -f "$f" ] || die "нет файла: $f"; done
+for e in "${ENVS[@]}"; do
+  [[ "$e" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "--env ожидает VAR=ЗНАЧЕНИЕ: $e"
+done
+
+APPDIR=$OPT/$NAME
+STAGE=""
+trap '[ -n "$STAGE" ] && rm -rf "$STAGE"' EXIT
+if [ -n "$TREE" ]; then
+  STAGE=$OPT/.$NAME.new.$$
+  WORK=$STAGE
+  BUNDLE_DIR=$APPDIR/.bundled
+  WORK_BUNDLE=$STAGE/.bundled
+else
+  WORK=$APPDIR
+  BUNDLE_DIR=$APPDIR/lib
+  WORK_BUNDLE=$APPDIR/lib
+fi
+
+echo "Установка '$NAME' → $APPDIR"
+
+# --- Список ELF-файлов для анализа -------------------------------------------
+SCAN=()
+TREE_ELF=(); TREE_KIND=()
+if [ -n "$TREE" ]; then
+  mkdir -p "$STAGE"
+  cp -a "$TREE/." "$STAGE/"
+  while IFS= read -r -d '' f; do
+    k=$(kind "$f")
+    case "$k" in
+      exe|lib) TREE_ELF+=("$f"); TREE_KIND+=("$k"); SCAN+=("$f") ;;
+      static)  TREE_ELF+=("$f"); TREE_KIND+=("$k") ;;
+    esac
+  done < <(find "$STAGE" -type f -print0)
+  [ ${#TREE_ELF[@]} -gt 0 ] \
+    || die "в $TREE нет ни одного исполняемого ELF-файла — проверьте, что сборка и make install прошли без ошибок"
+else
+  for f in "${FILES[@]}"; do
+    case "$(kind "$f")" in exe|lib) SCAN+=("$f") ;; esac
+  done
+fi
+for f in "${EXTRA_LIBS[@]}"; do
+  case "$(kind "$f")" in exe|lib) SCAN+=("$f") ;; esac
+done
+
+# --- Сбор зависимостей -------------------------------------------------------
+SYS_DIRS=(); MISSING=()
+declare -A BUNDLE=()
+
+is_system()   { case "$1" in /usr/*|/lib/*|/lib64/*) return 0 ;; *) return 1 ;; esac; }
+is_internal() {
+  [ -n "$TREE" ] || return 1
+  case "$1" in "$STAGE"/*|"$TREE"/*) return 0 ;; *) return 1 ;; esac
+}
+
+add_dir() {
+  local d x
+  d=$(readlink -f "$1")
+  for x in "${SYS_DIRS[@]}"; do [ "$x" = "$d" ] && return 0; done
+  SYS_DIRS+=("$d")
+}
+
+scan() {
+  local f=$1 line name path interp
+  interp=$(patchelf --print-interpreter "$f" 2>/dev/null || true)
+  [ -n "$interp" ] && add_dir "$(dirname "$(readlink -f "$interp")")"
+  while IFS= read -r line; do
+    line=${line#"${line%%[![:space:]]*}"}
+    name=${line%% *}
+    case "$line" in
+      *"=> not found"*) MISSING+=("${f#"$WORK"/}: $name") ;;
+      *"=> /"*)
+        path=${line#*=> }; path=${path% (*}
+        if is_system "$path"; then add_dir "$(dirname "$path")"
+        elif ! is_internal "$path"; then BUNDLE[$name]=$path
+        fi ;;
+    esac
+  done < <(ldd "$f" 2>/dev/null || true)
+}
+
+for f in "${SCAN[@]}"; do scan "$f"; done
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+  printf '  не найдено: %s\n' "${MISSING[@]}" >&2
+  die "установите недостающие библиотеки в chroot (apt install ...) и повторите"
+fi
+
+SYS_RPATH=""
+for d in "${SYS_DIRS[@]}"; do SYS_RPATH+="${SYS_RPATH:+:}$CHROOT$d"; done
+
+HAS_LIBS=0
+if [ ${#BUNDLE[@]} -gt 0 ] || [ ${#EXTRA_LIBS[@]} -gt 0 ]; then HAS_LIBS=1; fi
+
+# --- Патч --------------------------------------------------------------------
+patch_file() {  # FILE KIND
+  local dest=$1 k=$2 old entry rpath="" interp
+  local -a parts=()
+  if [ "$STRIP" = 1 ]; then strip --strip-debug "$dest" 2>/dev/null || true; fi
+  old=$(patchelf --print-rpath "$dest" 2>/dev/null || true)
+  IFS=: read -ra parts <<< "$old"
+  [ "$HAS_LIBS" = 1 ] && rpath=$BUNDLE_DIR
+  for entry in "${parts[@]}"; do
+    case "$entry" in *'$ORIGIN'*) rpath+=":$entry" ;; esac
+  done
+  rpath+="${SYS_RPATH:+:$SYS_RPATH}"
+  rpath=${rpath#:}
+  if [ "$k" = exe ]; then
+    interp=$(patchelf --print-interpreter "$dest")
+    patchelf --set-interpreter "$CHROOT$(readlink -f "$interp")" "$dest"
+  fi
+  patchelf --force-rpath --set-rpath "$rpath" "$dest"
+}
+
+install_file() {  # SRC DEST KIND
+  local tmp=$2.tmp.$$
+  cp -L "$1" "$tmp"
+  chmod u+w "$tmp"
+  case "$3" in
+    exe|lib) patch_file "$tmp" "$3" ;;
+    static)  if [ "$STRIP" = 1 ]; then strip --strip-debug "$tmp" 2>/dev/null || true; fi ;;
+  esac
+  mv -f "$tmp" "$2"   # замена через mv безопасна, даже если программа запущена
+}
+
+verify() {
+  local f=$1 interp out bad
+  interp=$(patchelf --print-interpreter "$f")
+  if [ ! -x "$interp" ]; then warn "${f#"$APPDIR"/}: проверка пропущена"; return 0; fi
+  out=$("$interp" --list "$f" 2>&1) || true
+  bad=$(printf '%s\n' "$out" | grep -vF -e linux-vdso -e "$CHROOT/" -e "$APPDIR/" || true)
+  if [ -n "$bad" ]; then
+    warn "${f#"$APPDIR"/}: есть библиотеки не из chroot:"
+    printf '%s\n' "$bad" | sed 's/^/      /' >&2
+  fi
+}
+
+write_wrapper() {  # LINK TARGET
+  local l=$1 target=$2 e var val icd="" j
+  {
+    echo '#!/bin/bash'
+    echo "# BUILD_ENV_WRAPPER $APPDIR/"
+    if [ "$GPU" = 1 ]; then
+      for j in /usr/share/vulkan/icd.d/*.json; do
+        if [ -e "$j" ]; then icd+="${icd:+:}$CHROOT$j"; fi
+      done
+      printf 'export VK_ICD_FILENAMES=%q\n' "$icd"
+      printf 'export LIBGL_DRIVERS_PATH=%q\n' "$CHROOT/usr/lib/x86_64-linux-gnu/dri"
+      printf 'export __EGL_VENDOR_LIBRARY_DIRS=%q\n' "$CHROOT/usr/share/glvnd/egl_vendor.d"
+      echo 'export NODEVICE_SELECT=1'
+    fi
+    for e in "${ENVS[@]}"; do
+      var=${e%%=*}; val=${e#*=}
+      val=${val//@CHROOT@/$CHROOT}; val=${val//@APP@/$APPDIR}
+      printf 'export %s=%q\n' "$var" "$val"
+    done
+    printf 'exec %q "$@"\n' "$target"
+  } > "$l"
+  chmod +x "$l"
+}
+
+make_link() {  # TARGET
+  local target=$1 l
+  l=$BIN/$(basename "$1")
+  [ -n "$FIRST_EXEC" ] || FIRST_EXEC=$target
+  [ "$LINK" = 1 ] || return 0
+  if [ -e "$l" ] || [ -L "$l" ]; then
+    if [ "$(readlink "$l" 2>/dev/null)" = "$target" ] \
+       || grep -qs "BUILD_ENV_WRAPPER $APPDIR/" "$l" || [ "$FORCE" = 1 ]; then
+      rm -f "$l"
+    else
+      warn "$l уже существует и создан не build-env — пропускаю (--force заменит)"
+      return 0
+    fi
+  fi
+  if [ "$GPU" = 1 ] || [ ${#ENVS[@]} -gt 0 ]; then
+    write_wrapper "$l" "$target"
+  else
+    ln -s "$target" "$l"
+  fi
+  grep -qxF "$l" "$APPDIR/.links" 2>/dev/null || echo "$l" >> "$APPDIR/.links"
+  LINKED=$((LINKED + 1))
+  [ "$FIRST_EXEC" = "$target" ] && FIRST_EXEC=$l
+  echo "  → $l"
+}
+
+record() { grep -qxF "$1" "$APPDIR/.links" 2>/dev/null || echo "$1" >> "$APPDIR/.links"; }
+
+find_icon() {  # ИМЯ_ИЛИ_ПУТЬ -> путь к файлу внутри приложения
+  local n=$1 c
+  case "$n" in
+    "$APPDIR"/*) if [ -f "$n" ]; then echo "$n"; return 0; fi ;;
+  esac
+  n=$(basename "$n"); n=${n%.svg}; n=${n%.png}; n=${n%.xpm}
+  for c in "$APPDIR/share/icons/hicolor/scalable/apps/$n.svg" \
+           "$APPDIR/share/pixmaps/$n.svg" "$APPDIR/share/pixmaps/$n.png" "$APPDIR/share/pixmaps/$n.xpm"; do
+    if [ -f "$c" ]; then echo "$c"; return 0; fi
+  done
+  c=$( (ls -1 "$APPDIR"/share/icons/hicolor/*/apps/"$n".png 2>/dev/null || true) | sort -V | tail -n1)
+  [ -n "$c" ] && echo "$c"
+  return 0
+}
+
+resolve_exec() {  # КОМАНДА -> путь для Exec=
+  local base
+  base=$(basename "$1")
+  if grep -qxF "$BIN/$base" "$APPDIR/.links" 2>/dev/null; then echo "$BIN/$base"
+  elif [ -x "$APPDIR/bin/$base" ]; then echo "$APPDIR/bin/$base"
+  else echo "$1"
+  fi
+}
+
+desktop_slot() {  # ФАЙЛ -> можно ли его записать
+  [ -e "$1" ] || return 0
+  grep -qs "BUILD_ENV_DESKTOP $APPDIR/" "$1" && return 0
+  [ "$FORCE" = 1 ] && return 0
+  warn "$1 уже существует и создан не build-env — пропускаю (--force заменит)"
+  return 1
+}
+
+install_desktop() {  # ИСХОДНЫЙ_.desktop
+  local src=$1 dst line key val cmd rest ic
+  dst=$APPS/$(basename "$src")
+  desktop_slot "$dst" || return 0
+  {
+    echo "# BUILD_ENV_DESKTOP $APPDIR/"
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "# BUILD_ENV_DESKTOP "*) continue ;;
+        Exec=*|TryExec=*)
+          key=${line%%=*}; val=${line#*=}
+          case "$val" in
+            \"*) ;;
+            *) cmd=${val%% *}; rest=${val#"$cmd"}; line="$key=$(resolve_exec "$cmd")$rest" ;;
+          esac ;;
+        Icon=*)
+          ic=$(find_icon "${line#Icon=}")
+          if [ -n "$ic" ]; then line="Icon=$ic"; fi ;;
+      esac
+      printf '%s\n' "$line"
+    done < "$src"
+  } > "$dst.tmp.$$"
+  mv -f "$dst.tmp.$$" "$dst"
+  record "$dst"
+  DESKTOPS=$((DESKTOPS + 1))
+  echo "  ярлык: $dst"
+}
+
+gen_desktop() {  # КОМАНДА
+  local dst=$APPS/$NAME.desktop icon=""
+  desktop_slot "$dst" || return 0
+  if [ -n "$ICON" ]; then
+    icon=$APPDIR/.icon.${ICON##*.}
+    cp -L "$ICON" "$icon"
+  fi
+  {
+    echo "# BUILD_ENV_DESKTOP $APPDIR/"
+    echo "[Desktop Entry]"
+    echo "Type=Application"
+    echo "Name=$NAME"
+    echo "Exec=$1"
+    if [ -n "$icon" ]; then echo "Icon=$icon"; fi
+    if [ "$TERMINAL" = 1 ]; then echo "Terminal=true"; else echo "Terminal=false"; fi
+    echo "Categories=Utility;"
+  } > "$dst.tmp.$$"
+  mv -f "$dst.tmp.$$" "$dst"
+  record "$dst"
+  DESKTOPS=$((DESKTOPS + 1))
+  echo "  ярлык: $dst"
+}
+
+mkdir -p "$WORK"
+[ "$HAS_LIBS" = 1 ] && mkdir -p "$WORK_BUNDLE"
+
+for name in "${!BUNDLE[@]}"; do
+  install_file "${BUNDLE[$name]}" "$WORK_BUNDLE/$name" "$(kind "${BUNDLE[$name]}")"
+  echo "  библиотека $name  (из ${BUNDLE[$name]})"
+done
+for f in "${EXTRA_LIBS[@]}"; do
+  k=$(kind "$f"); [ "$k" = exe ] && k=lib
+  install_file "$f" "$WORK_BUNDLE/$(basename "$f")" "$k"
+  echo "  библиотека $(basename "$f")  (--lib)"
+done
+
+if [ -n "$TREE" ]; then
+  patched=0
+  for i in "${!TREE_ELF[@]}"; do
+    f=${TREE_ELF[$i]}; k=${TREE_KIND[$i]}
+    case "$k" in
+      exe|lib)
+        if patch_file "$f" "$k"; then patched=$((patched + 1))
+        else warn "не удалось пропатчить ${f#"$STAGE"/}"
+        fi ;;
+      static) if [ "$STRIP" = 1 ]; then strip --strip-debug "$f" 2>/dev/null || true; fi ;;
+    esac
+  done
+  echo "  пропатчено ELF-файлов: $patched"
+
+  [ -f "$APPDIR/.links" ] && cp "$APPDIR/.links" "$STAGE/.links"
+  if [ -d "$APPDIR" ]; then
+    mv "$APPDIR" "$APPDIR.old.$$"
+    mv "$STAGE" "$APPDIR"
+    rm -rf "$APPDIR.old.$$"
+  else
+    mv "$STAGE" "$APPDIR"
+  fi
+  STAGE=""
+
+  while IFS= read -r -d '' f; do
+    [ "$(kind "$f")" = exe ] && verify "$f"
+  done < <(find "$APPDIR" -type f -print0)
+
+  if [ ${#LINKS[@]} -gt 0 ]; then
+    for rel in "${LINKS[@]}"; do
+      [ -e "$APPDIR/$rel" ] || { warn "нет $rel внутри дерева"; continue; }
+      make_link "$APPDIR/$rel"
+    done
+  elif [ -d "$APPDIR/bin" ]; then
+    for f in "$APPDIR"/bin/*; do
+      if [ -f "$f" ] && [ -x "$f" ]; then make_link "$f"; fi
+    done
+  else
+    warn "в дереве нет bin/ — укажите исполняемые файлы через --link"
+  fi
+else
+  for f in "${FILES[@]}"; do
+    k=$(kind "$f")
+    dest=$APPDIR/$(basename "$f")
+    install_file "$f" "$dest" "$k"
+    case "$k" in
+      exe)    echo "  $(basename "$dest"): загрузчик и библиотеки из chroot"; verify "$dest"; make_link "$dest" ;;
+      static) echo "  $(basename "$dest"): статический, патч не нужен"; make_link "$dest" ;;
+      lib)    echo "  $(basename "$dest"): библиотека, RPATH обновлён" ;;
+      other)  echo "  $(basename "$dest"): не ELF, скопирован как есть"; make_link "$dest" ;;
+    esac
+  done
+fi
+
+if [ "$DESKTOP" != 0 ]; then
+  mkdir -p "$APPS"
+  if [ -n "$TREE" ] && ls "$APPDIR"/share/applications/*.desktop >/dev/null 2>&1; then
+    for f in "$APPDIR"/share/applications/*.desktop; do install_desktop "$f"; done
+  elif [ "$DESKTOP" = 1 ]; then
+    if [ -n "$FIRST_EXEC" ]; then gen_desktop "$FIRST_EXEC"
+    else warn "нет исполняемого файла для ярлыка"
+    fi
+  fi
+fi
+
+if [ "$LINK" = 1 ] && [ "$LINKED" = 0 ]; then
+  warn "не создано ни одной ссылки в $BIN — запускать нечего (см. --link)"
+fi
+echo "Готово. Удалить: install-binary-from-build-env --remove $NAME"

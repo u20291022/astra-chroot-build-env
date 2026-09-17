@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning install.sh bin/activate-build-env bin/install-binary-from-build-env tests/hello/build.sh
+
+  e2e:
+    # glibc хоста (2.35) старше, чем в chroot: проверяем, что программа работает с glibc из chroot
+    runs-on: ubuntu-22.04
+    needs: shellcheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install.sh
+        run: bash install.sh --no-tour -y
+
+      - name: build and install hello
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "$HOME/hello"
+          cp tests/hello/* "$HOME/hello/"
+          cd "$HOME/hello"
+          activate-build-env bash build.sh
+
+      - name: run on host
+        run: |
+          host=$(ldd --version | head -n1 | grep -o '[0-9.]*$')
+          out=$("$HOME/.local/bin/hello")
+          echo "host glibc: $host"
+          echo "$out"
+          if echo "$out" | grep -q "glibc $host\$"; then
+            echo "программа использует glibc хоста, а не chroot" >&2
+            exit 1
+          fi
+          test -f "$HOME/.local/share/applications/hello.desktop"
+
+      - name: remove and uninstall
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          install-binary-from-build-env --remove hello
+          test ! -e "$HOME/.local/bin/hello"
+          test ! -e "$HOME/.local/share/applications/hello.desktop"
+          chroot_dir=$(sed -n 's/^CHROOT=//p' "$HOME/.config/astra-build-env/config")
+          bash install.sh --uninstall -y
+          bash install.sh --remove-chroot "$chroot_dir" -y
+          test ! -e "$chroot_dir"

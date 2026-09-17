@@ -1,0 +1,238 @@
+#!/bin/bash
+# activate-build-env — сборочное окружение (chroot) для текущей папки.
+# https://github.com/u20291022/astra-chroot-build-env
+set -euo pipefail
+
+VERSION=1.0.0
+
+usage() {
+  cat <<'EOF'
+activate-build-env — сборочное окружение (chroot) для текущей папки
+
+  activate-build-env                  оболочка для сборки (выход: exit или deactivate)
+  activate-build-env КОМАНДА [АРГ]    выполнить одну команду, например: activate-build-env make -j4
+  activate-build-env --root           оболочка root: установка -dev пакетов через apt
+  activate-build-env --root КОМАНДА   например: activate-build-env --root apt install libsdl2-dev
+
+Текущая папка видна внутри по тому же пути.
+Путь к chroot берётся из ~/.config/astra-build-env/config (CHROOT=...)
+или из переменной BUILD_ENV_CHROOT.
+
+Установка результата на хост: install-binary-from-build-env --help
+EOF
+}
+
+die()  { echo "activate-build-env: $*" >&2; exit 1; }
+warn() { echo "activate-build-env: $*" >&2; }
+
+config_chroot() {  # ДОМАШНИЙ_КАТАЛОГ
+  local cfg=$1/.config/astra-build-env/config
+  [ -f "$cfg" ] || return 0
+  sed -n 's/^CHROOT=//p' "$cfg" | tail -n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+
+ROOT_MODE=${BUILD_ENV_ROOT:-0}
+case "${1:-}" in
+  -h|--help)    usage; exit 0 ;;
+  -V|--version) echo "activate-build-env $VERSION"; exit 0 ;;
+  --root)       ROOT_MODE=1; shift ;;
+esac
+
+# --- Обычный пользователь: подготовить данные и перезапуститься через sudo ---
+if [ "$(id -u)" -ne 0 ]; then
+  CHROOT=${BUILD_ENV_CHROOT:-$(config_chroot "$HOME")}
+  CHROOT=${CHROOT:-$HOME/.local/share/astra-build-env/trixie}
+  TI=""
+  # Описание терминала (kitty, alacritty, foot...) может быть только на хосте
+  if [ -n "${TERM:-}" ] && command -v infocmp >/dev/null 2>&1 \
+     && infocmp -x "$TERM" >/dev/null 2>&1; then
+    TI=$(mktemp /tmp/buildenv-terminfo.XXXXXX)
+    infocmp -x "$TERM" > "$TI"
+  fi
+  exec sudo TERM="${TERM:-xterm}" BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_ROOT="$ROOT_MODE" \
+    BUILD_ENV_TERMINFO="$TI" "$(readlink -f "$0")" "$@"
+fi
+
+# --- Дальше выполняется от root ---
+SELF=$(readlink -f "$0")
+HOST_USER=${SUDO_USER:-}
+[ -n "$HOST_USER" ] && [ "$HOST_USER" != root ] \
+  || die "запускайте от обычного пользователя (sudo скрипт вызовет сам)"
+HOST_UID=$(id -u "$HOST_USER")
+HOST_GID=$(id -g "$HOST_USER")
+HOST_HOME=$(getent passwd "$HOST_USER" | cut -d: -f6)
+TERM=${TERM:-xterm}
+
+CHROOT=${BUILD_ENV_CHROOT:-$(config_chroot "$HOST_HOME")}
+CHROOT=${CHROOT:-$HOST_HOME/.local/share/astra-build-env/trixie}
+CHROOT=${CHROOT%/}
+PROJECT=$(pwd -P)
+OPT_DIR=$HOST_HOME/.local/opt/buildenv
+BIN_DIR=$HOST_HOME/.local/bin
+APPS_DIR=$HOST_HOME/.local/share/applications
+HELPER=$(dirname "$SELF")/install-binary-from-build-env
+
+[ -x "$CHROOT/bin/bash" ] || die "chroot не найден: $CHROOT (установите: см. README проекта)"
+[ -f "$HELPER" ] || die "рядом со скриптом нет install-binary-from-build-env"
+CHROOT_REAL=$(readlink -f "$CHROOT")
+
+CH_USER=root
+CH_HOME=/root
+if [ "$ROOT_MODE" != 1 ]; then
+  CH_ENT=$(chroot "$CHROOT" getent passwd "$HOST_UID") \
+    || die "в chroot нет пользователя с UID $HOST_UID"
+  CH_USER=$(echo "$CH_ENT" | cut -d: -f1)
+  CH_HOME=$(echo "$CH_ENT" | cut -d: -f6)
+fi
+
+# Защита от рекурсивных монтирований
+[ "$PROJECT" != / ] || die "нельзя активировать окружение в /"
+for d in "$PROJECT" "$OPT_DIR" "$BIN_DIR" "$APPS_DIR"; do
+  case "$d/" in "$CHROOT"/*|"$CHROOT_REAL"/*) die "$d находится внутри chroot" ;; esac
+  case "$CHROOT/" in "$d"/*) die "$d содержит сам chroot — перейдите в папку проекта" ;; esac
+done
+
+STATE_DIR=$CHROOT/var/lib/buildenv
+STATE=$STATE_DIR/mounts
+LOCK=$STATE_DIR/lock
+mkdir -p "$STATE_DIR"
+touch "$STATE"
+exec 9>"$LOCK"
+flock 9
+
+# Размонтировать всё, что смонтировали мы, когда в chroot не осталось процессов
+cleanup() {
+  exec 9>"$LOCK"
+  flock 9
+  local p m
+  for p in /proc/[0-9]*; do
+    if [ "$(readlink "$p/root" 2>/dev/null)" = "$CHROOT_REAL" ]; then
+      return 0
+    fi
+  done
+  tac "$STATE" | while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    if mountpoint -q "$m"; then
+      umount -R "$m" 2>/dev/null || umount -R -l "$m" 2>/dev/null \
+        || warn "не удалось размонтировать $m"
+    fi
+  done
+  : > "$STATE"
+}
+trap cleanup EXIT
+trap : INT
+
+track() { grep -qxF -- "$1" "$STATE" || echo "$1" >> "$STATE"; }
+
+mount_rbind() {
+  local dst=$CHROOT$1
+  mountpoint -q "$dst" && return 0
+  mkdir -p "$dst"
+  mount --rbind "$1" "$dst"
+  mount --make-rslave "$dst"
+  track "$dst"
+}
+
+mount_bind() {
+  local dst=$CHROOT$1
+  mountpoint -q "$dst" && return 0
+  mkdir -p "$dst"
+  mount --bind "$1" "$dst"
+  track "$dst"
+}
+
+for m in /proc /sys /dev /run; do
+  mount_rbind "$m"
+done
+
+for d in "$OPT_DIR" "$BIN_DIR" "$APPS_DIR"; do
+  [ -d "$d" ] || install -d -o "$HOST_UID" -g "$HOST_GID" "$d"
+done
+mount_bind "$OPT_DIR"
+mount_bind "$BIN_DIR"
+mount_bind "$APPS_DIR"
+mount_bind "$PROJECT"
+
+# Внутри chroot путь "$CHROOT" указывает на "/", чтобы пропатченные бинарники
+# можно было проверить и запустить прямо в окружении.
+LINK=$CHROOT$CHROOT
+if [ ! -L "$LINK" ]; then
+  [ -d "$LINK" ] && rmdir "$LINK" 2>/dev/null || true
+  if [ -e "$LINK" ]; then
+    warn "$LINK занят — проверка установленных бинарников будет пропущена"
+  else
+    mkdir -p "$(dirname "$LINK")"
+    ln -s / "$LINK"
+  fi
+fi
+
+cp -L --remove-destination /etc/resolv.conf "$CHROOT/etc/resolv.conf" 2>/dev/null || true
+
+# Описание терминала
+if chroot "$CHROOT" sh -c 'command -v infocmp' >/dev/null 2>&1; then
+  if [ -n "${BUILD_ENV_TERMINFO:-}" ] && [ -f "$BUILD_ENV_TERMINFO" ]; then
+    if ! chroot "$CHROOT" infocmp "$TERM" >/dev/null 2>&1; then
+      mkdir -p "$CHROOT/etc/terminfo"
+      cp "$BUILD_ENV_TERMINFO" "$CHROOT/tmp/buildenv-terminfo.$$"
+      chroot "$CHROOT" tic -x -o /etc/terminfo "/tmp/buildenv-terminfo.$$" >/dev/null 2>&1 || true
+      rm -f "$CHROOT/tmp/buildenv-terminfo.$$"
+    fi
+  fi
+  if ! chroot "$CHROOT" infocmp "$TERM" >/dev/null 2>&1; then
+    warn "в chroot нет описания терминала $TERM — использую xterm-256color"
+    TERM=xterm-256color
+  fi
+fi
+[ -n "${BUILD_ENV_TERMINFO:-}" ] && rm -f "$BUILD_ENV_TERMINFO"
+
+if ! chroot "$CHROOT" sh -c 'command -v patchelf && command -v strip' >/dev/null 2>&1; then
+  echo "Устанавливаю patchelf и binutils в chroot..."
+  chroot "$CHROOT" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq patchelf binutils >/dev/null 2>&1 \
+    || die "не удалось установить patchelf в chroot (activate-build-env --root apt install patchelf)"
+fi
+
+install -m 0755 "$HELPER" "$CHROOT/usr/local/bin/install-binary-from-build-env"
+
+cat > "$CHROOT/etc/buildenv.bashrc" <<'EOF'
+[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+export PATH="$HOME/.cargo/bin:$HOME/.local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH"
+alias deactivate=exit
+cd "$BUILD_ENV_PROJECT" 2>/dev/null || true
+if [ -z "${BUILD_ENV_QUIET:-}" ]; then
+  if [ "$(id -u)" = 0 ]; then
+    PS1="(build-env:root) ${PS1:-\u@\h:\w\# }"
+    echo "build-env (root): устанавливайте пакеты через apt, собирать и ставить программы — без --root"
+  else
+    PS1="(build-env) ${PS1:-\u@\h:\w\$ }"
+    echo "build-env: $BUILD_ENV_PROJECT"
+    echo "  установить на хост:  install-binary-from-build-env <файл>   (подробно: --help)"
+    echo "  выйти:               exit"
+  fi
+fi
+EOF
+
+flock -u 9
+
+ENVV=(
+  HOME="$CH_HOME" USER="$CH_USER" LOGNAME="$CH_USER" SHELL=/bin/bash
+  TERM="$TERM" LANG=C.UTF-8
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  BUILD_ENV=1 BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_PROJECT="$PROJECT"
+  BUILD_ENV_OPT="$OPT_DIR" BUILD_ENV_BIN="$BIN_DIR" BUILD_ENV_APPS="$APPS_DIR"
+)
+if [ "$ROOT_MODE" = 1 ]; then
+  RUN=(chroot "$CHROOT" env -i "${ENVV[@]}")
+else
+  RUN=(chroot "$CHROOT" runuser -u "$CH_USER" -- env -i "${ENVV[@]}")
+fi
+
+set +e
+if [ $# -eq 0 ]; then
+  "${RUN[@]}" bash --rcfile /etc/buildenv.bashrc -i 9>&-
+else
+  "${RUN[@]}" BUILD_ENV_QUIET=1 bash -c '. /etc/buildenv.bashrc; exec "$@"' build-env "$@" 9>&-
+fi
+RC=$?
+set -e
+exit $RC
