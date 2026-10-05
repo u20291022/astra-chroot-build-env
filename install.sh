@@ -148,7 +148,7 @@ uninstall() {
       done
     fi
   fi
-  rm -f "$BIN_DIR/activate-build-env" "$BIN_DIR/install-binary-from-build-env"
+  rm -f "$BIN_DIR/activate-build-env" "$BIN_DIR/install-binary-from-build-env" "$BIN_DIR/update-build-env"
   rm -rf "$CONFIG_DIR" "$WORK_DIR"
   for f in "$HOME/.profile" "$HOME/.bashrc"; do
     [ -f "$f" ] && grep -qxF "$MARK" "$f" && sed -i "/^$MARK\$/,+1d" "$f"
@@ -185,7 +185,7 @@ install_scripts() {
   fi
   say "Установка скриптов в $BIN_DIR"
   mkdir -p "$BIN_DIR"
-  for s in activate-build-env install-binary-from-build-env; do
+  for s in activate-build-env install-binary-from-build-env update-build-env; do
     if [ -n "$src" ]; then
       cp "$src/$s" "$BIN_DIR/$s.tmp"
     else
@@ -319,6 +319,8 @@ ${B}Как пользоваться${N}
   install-binary-from-build-env --list               ${Y}# что установлено${N}
   install-binary-from-build-env --remove ИМЯ         ${Y}# удалить программу${N}
   install-binary-from-build-env --help               ${Y}# параметры и сложные случаи${N}
+  update-build-env                                   ${Y}# есть ли обновления программ${N}
+  update-build-env --install                         ${Y}# поставить обновления${N}
 
   Chroot: $CHROOT
   Не удаляйте его: установленные программы берут оттуда библиотеки.

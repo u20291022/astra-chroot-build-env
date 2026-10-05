@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck -S warning install.sh bin/activate-build-env bin/install-binary-from-build-env tests/hello/build.sh
+      - run: shellcheck -S warning install.sh bin/activate-build-env bin/install-binary-from-build-env bin/update-build-env tests/hello/build.sh
 
   e2e:
     # glibc хоста (2.35) старше, чем в chroot: проверяем, что программа работает с glibc из chroot

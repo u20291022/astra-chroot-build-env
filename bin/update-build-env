@@ -1,0 +1,495 @@
+#!/bin/bash
+# update-build-env — обновление программ, установленных через install-binary-from-build-env.
+# https://github.com/u20291022/astra-chroot-build-env
+set -euo pipefail
+
+VERSION=1.1.0
+
+OPT=${BUILD_ENV_OPT:-$HOME/.local/opt/buildenv}
+BIN=${BUILD_ENV_BIN:-$HOME/.local/bin}
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/update-build-env
+GH_API=${UPDATE_BUILD_ENV_GH_API:-https://api.github.com}
+GH_WEB=${UPDATE_BUILD_ENV_GH_WEB:-https://github.com}
+NOTIFY_INTERVAL=${UPDATE_BUILD_ENV_NOTIFY_INTERVAL:-72000}   # секунд между проверками --notify
+
+die()  { echo "update-build-env: $*" >&2; exit 1; }
+warn() { echo "  ! $*" >&2; }
+
+if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+else B=""; G=""; Y=""; D=""; N=""; fi
+
+usage() {
+  cat <<'EOF'
+update-build-env — обновления программ, установленных через install-binary-from-build-env
+
+ИСПОЛЬЗОВАНИЕ
+  update-build-env                    проверить, для чего есть обновления (ничего не ставит)
+  update-build-env --install [ИМЯ...] поставить обновления (всех программ или указанных)
+  update-build-env --chroot           обновить пакеты самого chroot (apt full-upgrade):
+                                      свежие библиотеки сразу получат все программы
+  update-build-env --track ИМЯ [ИСТОЧНИК] [--asset РЕГВЫР] [--version ВЕРСИЯ] [-- ПАРАМЕТРЫ]
+                                      откуда брать обновления для программы
+  update-build-env --untrack ИМЯ      больше не следить за программой
+  update-build-env --notify           тихая проверка с уведомлением (для автозапуска сеанса)
+
+ИСТОЧНИКИ
+  github:ВЛАДЕЛЕЦ/РЕПОЗИТОРИЙ   последний релиз на GitHub (без пре-релизов)
+                                файл релиза выбирается по --asset (регулярное выражение),
+                                по умолчанию: .deb или .tar.gz/.tar.xz для amd64/x86_64
+
+  Для известных программ источник указывать не нужно:
+    zed           github:zed-industries/zed           zed-linux-x86_64.tar.gz
+    clash-verge   github:clash-verge-rev/clash-verge-rev   *_amd64.deb
+
+  Поддерживаемые файлы релиза: .deb, .tar.gz/.tgz, .tar.xz, .tar.bz2/.tbz, .zip,
+  .AppImage, одиночный исполняемый файл.
+
+ПАРАМЕТРЫ УСТАНОВКИ
+  Обновление ставится с теми же параметрами, что и прошлая установка (--gpu, --env, --link...).
+  Для программ, поставленных до версии 1.1, они восстанавливаются по обёртке в ~/.local/bin.
+  Задать вручную: update-build-env --track ИМЯ ИСТОЧНИК -- --gpu --env FOO=bar
+
+ПРИМЕРЫ
+  update-build-env --track zed
+  update-build-env --track helix github:helix-editor/helix --asset 'x86_64-linux\.tar\.xz$'
+  update-build-env
+  update-build-env --install
+
+GitHub без токена разрешает 60 запросов API в час; при нехватке задайте GITHUB_TOKEN.
+EOF
+}
+
+# --- Известные программы ------------------------------------------------------
+preset() {  # ИМЯ -> P_SOURCE P_ASSET P_OPTS
+  P_SOURCE=""; P_ASSET=""; P_OPTS=()
+  case "$1" in
+    zed)
+      P_SOURCE=github:zed-industries/zed
+      P_ASSET='^zed-linux-x86_64\.tar\.gz$'
+      P_OPTS=(--gpu) ;;
+    clash-verge|clash-verge-rev)
+      P_SOURCE=github:clash-verge-rev/clash-verge-rev
+      P_ASSET='_amd64\.deb$' ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- Общие функции ------------------------------------------------------------
+check_name() { case "$1" in ""|*/*|.*) die "некорректное имя: '$1'" ;; esac; }
+
+chroot_path() {
+  local c=${BUILD_ENV_CHROOT:-}
+  if [ -z "$c" ] && [ -f "$HOME/.config/astra-build-env/config" ]; then
+    c=$(sed -n 's/^CHROOT=//p' "$HOME/.config/astra-build-env/config" | tail -n1 \
+        | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/")
+  fi
+  echo "${c:-$HOME/.local/share/astra-build-env/trixie}"
+}
+
+http_get() {  # URL ФАЙЛ [api]
+  local url=$1 out=$2 api=${3:-}
+  local -a h=()
+  if [ "$api" = api ] && [ -n "${GITHUB_TOKEN:-}" ]; then h=(-H "Authorization: Bearer $GITHUB_TOKEN"); fi
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 2 "${h[@]}" -o "$out" "$url"
+  else
+    local -a wh=()
+    if [ ${#h[@]} -gt 0 ]; then wh=(--header="${h[1]}"); fi
+    wget -q --tries=3 "${wh[@]}" -O "$out" "$url"
+  fi
+}
+
+http_redirect() {  # URL -> адрес перенаправления (без перехода)
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -o /dev/null -w '%{redirect_url}' "$1" 2>/dev/null || true
+  else
+    wget -q --max-redirect=0 -S -O /dev/null "$1" 2>&1 | sed -n 's/^ *Location: *//p' | tail -n1 || true
+  fi
+}
+
+download() {  # URL ФАЙЛ — с индикатором, если есть терминал
+  if [ -t 2 ] && command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 2 --progress-bar -o "$2" "$1"
+  elif [ -t 2 ]; then
+    wget -q --show-progress -O "$2" "$1"
+  else
+    http_get "$1" "$2"
+  fi
+}
+
+urldecode() { local s=${1//+/ }; printf '%b' "${s//%/\\x}"; }
+
+# --- Метаданные приложения -----------------------------------------------------
+# $OPT/ИМЯ/.update:        SOURCE ASSET VERSION OPTS=(...)   (пишет update-build-env)
+# $OPT/ИМЯ/.install-opts:  OPTS=(...)                        (пишет install-binary-from-build-env 1.1+)
+load_meta() {  # ИМЯ
+  SOURCE=""; ASSET=""; INSTALLED=""; OPTS=()
+  local f=$OPT/$1/.update VERSION=""
+  if [ -f "$f" ]; then
+    # shellcheck disable=SC1090
+    . "$f"
+    INSTALLED=$VERSION
+  fi
+}
+
+save_meta() {  # ИМЯ
+  local f=$OPT/$1/.update o
+  {
+    echo "# update-build-env: откуда обновлять эту программу"
+    printf 'SOURCE=%q\n' "$SOURCE"
+    printf 'ASSET=%q\n' "$ASSET"
+    printf 'VERSION=%q\n' "$INSTALLED"
+    printf 'OPTS=('
+    for o in "${OPTS[@]}"; do printf ' %q' "$o"; done
+    printf ' )\n'
+  } > "$f.tmp.$$"
+  mv -f "$f.tmp.$$" "$f"
+}
+
+# Параметры прошлой установки: .install-opts, а для старых установок — по обёрткам
+derive_opts() {  # ИМЯ -> OPTS
+  local name=$1 d=$OPT/$1 l t line var val ch gpu=0 desk=0 key
+  local -a links=() envs=()
+  OPTS=()
+  if [ -f "$d/.install-opts" ]; then
+    # shellcheck disable=SC1090
+    . "$d/.install-opts"
+    return 0
+  fi
+  ch=$(chroot_path)
+  [ -f "$d/.links" ] || return 0
+  while IFS= read -r l; do
+    case "$l" in
+      *.desktop) desk=1; continue ;;
+      "$BIN"/*) ;;
+      *) continue ;;
+    esac
+    t=""
+    if [ -L "$l" ]; then
+      t=$(readlink "$l")
+    elif grep -qs "BUILD_ENV_WRAPPER $d/" "$l"; then
+      while IFS= read -r line; do
+        case "$line" in
+          "export VK_ICD_FILENAMES="*) gpu=1 ;;
+          "export LIBGL_DRIVERS_PATH="*|"export __EGL_VENDOR_LIBRARY_DIRS="*|"export NODEVICE_SELECT="*) ;;
+          export\ [A-Za-z_]*=*)
+            var=${line#export }; var=${var%%=*}
+            eval "val=${line#*=}"
+            val=${val//"$d"/@APP@}; val=${val//"$ch"/@CHROOT@}
+            key="$var=$val"
+            case " ${envs[*]-} " in *" $key "*) ;; *) envs+=("$key") ;; esac ;;
+          exec\ *)
+            line=${line#exec }; line=${line% \"\$@\"}
+            eval "t=$line" ;;
+        esac
+      done < "$l"
+    fi
+    case "$t" in "$d"/*) links+=(--link "${t#"$d"/}") ;; esac
+  done < "$d/.links"
+  [ "$gpu" = 1 ] && OPTS+=(--gpu)
+  for val in "${envs[@]}"; do OPTS+=(--env "$val"); done
+  OPTS+=("${links[@]}")
+  [ "$desk" = 1 ] || OPTS+=(--no-desktop)
+  return 0
+}
+
+# --- GitHub ------------------------------------------------------------------
+# latest_release ВЛАДЕЛЕЦ/РЕПО -> REL_TAG, REL_ASSETS (строки «имя<TAB>url»)
+latest_release() {
+  local repo=$1 tmp tag url
+  REL_TAG=""; REL_ASSETS=""
+  tmp=$(mktemp)
+  if http_get "$GH_API/repos/$repo/releases/latest" "$tmp" api 2>/dev/null; then
+    REL_TAG=$(grep -o '"tag_name": *"[^"]*"' "$tmp" | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')
+    REL_ASSETS=$(grep -o '"browser_download_url": *"[^"]*"' "$tmp" | sed 's/.*"\([^"]*\)"$/\1/' \
+      | while IFS= read -r url; do printf '%s\t%s\n' "$(urldecode "${url##*/}")" "$url"; done)
+  fi
+  if [ -z "$REL_TAG" ]; then
+    # Запасной путь без API (лимит запросов): перенаправление /releases/latest и страница файлов
+    url=$(http_redirect "$GH_WEB/$repo/releases/latest")
+    case "$url" in */releases/tag/*) tag=${url##*/releases/tag/} ;; *) tag="" ;; esac
+    if [ -n "$tag" ] && http_get "$GH_WEB/$repo/releases/expanded_assets/$tag" "$tmp" 2>/dev/null; then
+      REL_TAG=$(urldecode "$tag")
+      REL_ASSETS=$(grep -o "href=\"[^\"]*/$repo/releases/download/[^\"]*\"" "$tmp" \
+        | sed 's/^href="//; s/"$//' | sort -u \
+        | while IFS= read -r url; do
+            case "$url" in /*) url=$GH_WEB$url ;; esac
+            printf '%s\t%s\n' "$(urldecode "${url##*/}")" "$url"
+          done)
+    fi
+  fi
+  rm -f "$tmp"
+  [ -n "$REL_TAG" ]
+}
+
+pick_asset() {  # РЕГВЫР|"" -> ASSET_NAME ASSET_URL
+  local re=$1 line
+  ASSET_NAME=""; ASSET_URL=""
+  local -a tries=()
+  if [ -n "$re" ]; then tries=("$re")
+  else
+    tries=('(amd64|x86_64).*\.deb$'
+           '(linux.*(amd64|x86_64)|(amd64|x86_64).*linux).*\.(tar\.gz|tgz|tar\.xz|tar\.bz2|tbz2?)$'
+           '(amd64|x86_64).*\.AppImage$')
+  fi
+  for re in "${tries[@]}"; do
+    line=$(printf '%s\n' "$REL_ASSETS" | awk -F'\t' -v re="$re" '$1 ~ re && $1 !~ /\.(sha256|sha512|sig|asc|minisig|sbom|json|txt)$/ {print; exit}')
+    if [ -n "$line" ]; then
+      ASSET_NAME=${line%%$'\t'*}; ASSET_URL=${line#*$'\t'}
+      return 0
+    fi
+  done
+  return 1
+}
+
+source_repo() {  # SOURCE -> репозиторий
+  case "$1" in
+    github:*/*) echo "${1#github:}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- Подготовка дерева из файла релиза -------------------------------------------
+prepare_tree() {  # ФАЙЛ ПАПКА ИМЯ -> печатает путь к дереву
+  local f=$1 name=$3 x=$2/x top
+  rm -rf "$x"; mkdir -p "$x"
+  case "$f" in
+    *.deb)
+      dpkg-deb -x "$f" "$x" || return 1
+      if [ -d "$x/usr/bin" ] || [ -d "$x/usr/lib" ]; then echo "$x/usr"; return 0; fi
+      top=$(find "$x/opt" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+      if [ -n "$top" ] && [ "$(printf '%s\n' "$top" | wc -l)" = 1 ]; then echo "$top"; return 0; fi
+      echo "$x"; return 0 ;;
+    *.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz|*.tbz2|*.tar.zst|*.tar)
+      tar -xf "$f" -C "$x" || return 1 ;;
+    *.zip)
+      command -v unzip >/dev/null 2>&1 || { warn "нужен unzip (sudo apt install unzip)"; return 1; }
+      unzip -q "$f" -d "$x" || return 1 ;;
+    *.AppImage|*.appimage)
+      chmod +x "$f"
+      (cd "$x" && "$f" --appimage-extract >/dev/null 2>&1) || { warn "не удалось распаковать AppImage"; return 1; }
+      if [ -d "$x/squashfs-root/usr/bin" ]; then echo "$x/squashfs-root/usr"; else echo "$x/squashfs-root"; fi
+      return 0 ;;
+    *)
+      if [ "$(head -c4 "$f" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ]; then
+        mkdir -p "$x/bin"; cp "$f" "$x/bin/$name"; chmod +x "$x/bin/$name"
+        echo "$x"; return 0
+      fi
+      warn "неизвестный формат файла: $(basename "$f")"; return 1 ;;
+  esac
+  top=$(find "$x" -mindepth 1 -maxdepth 1)
+  if [ "$(printf '%s\n' "$top" | wc -l)" = 1 ] && [ -d "$top" ]; then echo "$top"; else echo "$x"; fi
+}
+
+# --- Команды -----------------------------------------------------------------
+apps() { local d; for d in "$OPT"/*/; do [ -d "$d" ] && basename "$d"; done; return 0; }
+
+# check -> UPD_NAMES (есть обновление), печатает таблицу если $1 != quiet
+check() {
+  local mode=${1:-} name repo cur
+  UPD_NAMES=(); UPD_INFO=()
+  local any=0
+  for name in $(apps); do
+    any=1
+    load_meta "$name"
+    if [ -z "$SOURCE" ]; then
+      if [ "$mode" != quiet ]; then
+        if preset "$name"; then
+          printf '  %-14s %sисточник не задан%s — известная программа: update-build-env --track %s\n' "$name" "$D" "$N" "$name"
+        else
+          printf '  %-14s %sисточник не задан%s\n' "$name" "$D" "$N"
+        fi
+      fi
+      continue
+    fi
+    if ! repo=$(source_repo "$SOURCE"); then
+      [ "$mode" = quiet ] || printf '  %-14s %sнеизвестный источник %s%s\n' "$name" "$Y" "$SOURCE" "$N"
+      continue
+    fi
+    if ! latest_release "$repo"; then
+      [ "$mode" = quiet ] || printf '  %-14s %sне удалось узнать последний релиз %s%s\n' "$name" "$Y" "$repo" "$N"
+      continue
+    fi
+    cur=${INSTALLED:-?}
+    if [ "$INSTALLED" = "$REL_TAG" ]; then
+      [ "$mode" = quiet ] || printf '  %-14s %s%s%s  актуальная\n' "$name" "$G" "$cur" "$N"
+    else
+      UPD_NAMES+=("$name"); UPD_INFO+=("$name $cur → $REL_TAG")
+      [ "$mode" = quiet ] || printf '  %-14s %s%s → %s%s\n' "$name" "$B$Y" "$cur" "$REL_TAG" "$N"
+    fi
+  done
+  if [ "$any" = 0 ] && [ "$mode" != quiet ]; then echo "  Ничего не установлено."; fi
+  return 0
+}
+
+do_check() {
+  echo "${B}Программы build-env${N}"
+  check
+  if [ ${#UPD_NAMES[@]} -gt 0 ]; then
+    echo; echo "Поставить: ${B}update-build-env --install${N}  (или --install ИМЯ)"
+  fi
+}
+
+do_install() {
+  local -a want=("$@") todo=() ok_names=()
+  local name repo work run f tree rc
+  command -v activate-build-env >/dev/null 2>&1 || die "не найден activate-build-env"
+  if [ ${#want[@]} -eq 0 ]; then
+    check quiet
+    want=("${UPD_NAMES[@]}")
+    [ ${#want[@]} -gt 0 ] || { echo "Обновлений нет."; return 0; }
+  fi
+  work=$CACHE/work
+  rm -rf "$work"; mkdir -p "$work"
+  run=$work/run.sh
+  {
+    echo '#!/bin/bash'
+    echo 'cd "$(dirname "$0")"'
+  } > "$run"
+
+  for name in "${want[@]}"; do
+    check_name "$name"
+    [ -d "$OPT/$name" ] || { warn "$name: не установлено"; continue; }
+    load_meta "$name"
+    [ -n "$SOURCE" ] || { warn "$name: источник не задан (update-build-env --track $name ...)"; continue; }
+    repo=$(source_repo "$SOURCE") || { warn "$name: неизвестный источник $SOURCE"; continue; }
+    echo "${B}==> $name${N}"
+    latest_release "$repo" || { warn "$name: не удалось узнать последний релиз $repo"; continue; }
+    if ! pick_asset "$ASSET"; then
+      warn "$name: в релизе $REL_TAG нет подходящего файла${ASSET:+ (--asset '$ASSET')}. Файлы релиза:"
+      printf '%s\n' "$REL_ASSETS" | cut -f1 | sed 's/^/      /' >&2
+      continue
+    fi
+    echo "  ${INSTALLED:-?} → $REL_TAG: $ASSET_NAME"
+    mkdir -p "$work/$name"
+    f=$work/$name/$ASSET_NAME
+    download "$ASSET_URL" "$f" || { warn "$name: не удалось скачать $ASSET_URL"; continue; }
+    tree=$(prepare_tree "$f" "$work/$name" "$name") || { warn "$name: не удалось распаковать"; continue; }
+    rm -f "$f"
+    [ ${#OPTS[@]} -gt 0 ] || derive_opts "$name"
+    printf '%s\n' "$REL_TAG" > "$work/$name/.tag"
+    {
+      printf 'echo; echo %q\n' "==> установка $name $REL_TAG"
+      printf 'if install-binary-from-build-env --force'
+      for o in "${OPTS[@]}"; do printf ' %q' "$o"; done
+      printf ' --name %q --tree %q; then touch %q; fi\n' "$name" "$tree" "$work/$name/.ok"
+    } >> "$run"
+    # сохраняем параметры сразу, чтобы восстановленные по обёрткам не терялись
+    save_meta "$name"
+    todo+=("$name")
+  done
+
+  [ ${#todo[@]} -gt 0 ] || { rm -rf "$work"; die "нечего ставить"; }
+  chmod +x "$run"
+  echo; echo "${B}==> Установка через build-env${N} (sudo спросит пароль)"
+  set +e
+  (cd "$work" && activate-build-env bash "$run")
+  rc=$?
+  set -e
+
+  for name in "${todo[@]}"; do
+    if [ -f "$work/$name/.ok" ]; then
+      load_meta "$name"
+      [ ${#OPTS[@]} -gt 0 ] || derive_opts "$name"
+      INSTALLED=$(cat "$work/$name/.tag")
+      save_meta "$name"
+      ok_names+=("$name $INSTALLED")
+    else
+      warn "$name: установка не удалась (см. вывод выше)"
+    fi
+  done
+  rm -rf "$work"
+  echo
+  if [ ${#ok_names[@]} -gt 0 ]; then printf '%sОбновлено:%s %s\n' "$G" "$N" "$(IFS=,; echo "${ok_names[*]}" | sed 's/,/, /g')"; fi
+  [ ${#ok_names[@]} -eq ${#todo[@]} ] && [ $rc -eq 0 ]
+}
+
+do_track() {
+  local name=${1:-} src="" asset="" ver="" have_asset=0 have_ver=0 have_opts=0
+  local -a opts=()
+  check_name "$name"; shift
+  [ -d "$OPT/$name" ] || die "программа '$name' не установлена (install-binary-from-build-env --list)"
+  if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then src=$1; shift; fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --asset)   asset=${2:?"--asset требует значение"}; have_asset=1; shift 2 ;;
+      --version) ver=${2:?"--version требует значение"}; have_ver=1; shift 2 ;;
+      --) shift; opts=("$@"); have_opts=1; break ;;
+      *) die "неизвестный параметр: $1" ;;
+    esac
+  done
+  load_meta "$name"
+  if [ -z "$src" ]; then
+    if preset "$name"; then
+      src=$P_SOURCE
+      [ "$have_asset" = 1 ] || { asset=$P_ASSET; have_asset=1; }
+    elif [ -n "$SOURCE" ]; then src=$SOURCE
+    else die "укажите источник, например: update-build-env --track $name github:владелец/репозиторий"
+    fi
+  fi
+  source_repo "$src" >/dev/null || die "неизвестный источник: $src (поддерживается github:ВЛАДЕЛЕЦ/РЕПО)"
+  SOURCE=$src
+  [ "$have_asset" = 1 ] && ASSET=$asset
+  [ "$have_ver" = 1 ] && INSTALLED=$ver
+  if [ "$have_opts" = 1 ]; then OPTS=("${opts[@]}")
+  elif [ ${#OPTS[@]} -eq 0 ]; then
+    derive_opts "$name"
+    if [ ${#OPTS[@]} -eq 0 ] && preset "$name"; then OPTS=("${P_OPTS[@]}"); fi
+  fi
+  save_meta "$name"
+  echo "$name: источник $SOURCE${ASSET:+, файл ~ /$ASSET/}"
+  echo "  параметры установки: ${OPTS[*]:-(по умолчанию)}"
+  echo "  установленная версия: ${INSTALLED:-неизвестна — первая же --install поставит последнюю}"
+  if latest_release "$(source_repo "$SOURCE")"; then
+    if pick_asset "$ASSET"; then echo "  последний релиз: $REL_TAG ($ASSET_NAME)"
+    else warn "в релизе $REL_TAG нет подходящего файла, задайте --asset"; printf '%s\n' "$REL_ASSETS" | cut -f1 | sed 's/^/      /' >&2
+    fi
+  else
+    warn "не удалось получить последний релиз — проверьте имя репозитория"
+  fi
+}
+
+do_untrack() {
+  check_name "${1:-}"
+  rm -f "$OPT/$1/.update"
+  echo "$1: обновления больше не отслеживаются"
+}
+
+do_chroot() {
+  echo "${B}==> Обновление пакетов chroot $(chroot_path)${N}"
+  mkdir -p "$CACHE"
+  cd "$CACHE"
+  activate-build-env --root sh -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade && apt-get -y autoremove && apt-get clean'
+  echo "${G}Готово.${N} Программы используют библиотеки chroot, перезапустите открытые."
+}
+
+do_notify() {
+  local stamp=$CACHE/last-notify now last=0
+  mkdir -p "$CACHE"
+  now=$(date +%s)
+  [ -f "$stamp" ] && last=$(cat "$stamp" 2>/dev/null || echo 0)
+  if [ "${1:-}" != --force ] && [ $((now - last)) -lt "$NOTIFY_INTERVAL" ]; then return 0; fi
+  echo "$now" > "$stamp"
+  check quiet
+  [ ${#UPD_NAMES[@]} -gt 0 ] || return 0
+  local body
+  body=$(printf '%s\n' "${UPD_INFO[@]}")
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a update-build-env -i system-software-update "Есть обновления программ" \
+      "$body"$'\n'"update-build-env --install"
+  else
+    printf 'Есть обновления:\n%s\n' "$body"
+  fi
+}
+
+case "${1:-}" in
+  "")            do_check ;;
+  --install|-i)  shift; do_install "$@" ;;
+  --chroot)      do_chroot ;;
+  --track)       shift; do_track "$@" ;;
+  --untrack)     shift; do_untrack "${1:-}" ;;
+  --notify)      shift; do_notify "${1:-}" ;;
+  -V|--version)  echo "update-build-env $VERSION" ;;
+  -h|--help)     usage ;;
+  *)             die "неизвестный параметр: $1 (см. --help)" ;;
+esac

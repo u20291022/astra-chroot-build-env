@@ -27,7 +27,7 @@ wget -qO- https://raw.githubusercontent.com/u20291022/astra-chroot-build-env/mai
 
 Установщик:
 
-- кладёт `activate-build-env` и `install-binary-from-build-env` в `~/.local/bin`;
+- кладёт `activate-build-env`, `install-binary-from-build-env` и `update-build-env` в `~/.local/bin`;
 - создаёт chroot в `~/.local/share/astra-build-env/trixie` (≈300 МБ загрузки, 1–2 ГБ с пакетами);
 - ставит в него компиляторы и сборочные утилиты;
 - проводит короткий экскурс: собирает и устанавливает [btop](https://github.com/aristocratos/btop).
@@ -101,19 +101,49 @@ install-binary-from-build-env --remove btop
 install-binary-from-build-env --help      # все параметры и сложные случаи
 ```
 
+## Обновление программ
+
+`update-build-env` проверяет, вышли ли новые версии, и ставит их так же, как
+`install-binary-from-build-env`: с загрузчиком и библиотеками из chroot и с теми же
+параметрами, что и прошлая установка (`--gpu`, `--env`, `--link`...).
+
+```bash
+update-build-env --track zed                      # известная программа: источник уже знаком
+update-build-env --track clash-verge
+update-build-env --track helix github:helix-editor/helix --asset 'x86_64-linux\.tar\.xz$'
+
+update-build-env                                  # что можно обновить
+update-build-env --install                        # поставить все обновления (один пароль sudo)
+update-build-env --install zed                    # только одну программу
+update-build-env --chroot                         # обновить пакеты самого chroot
+```
+
+Источник — последний релиз на GitHub. Подходят `.deb`, архивы `.tar.*`/`.zip`, AppImage
+и одиночный бинарник. Программы, собранные из исходников, обновляются пересборкой.
+
+**Встроенные автообновления программ отключайте** (в Zed: `"auto_update": false`):
+они скачивают официальную сборку поверх пропатченной, и та перестаёт запускаться
+(`GLIBC_2.29 not found`). Пакеты `.deb` таких программ не ставьте на хост через `dpkg -i`.
+
+Уведомление о новых версиях при входе в сеанс (не чаще раза в 20 часов):
+добавьте `update-build-env --notify` в автозапуск, например в `~/.config/awesome/rc.lua`:
+
+```lua
+awful.spawn.with_shell("sleep 60; update-build-env --notify")
+```
+
 ## Что где лежит
 
 | Путь | Что |
 |---|---|
 | `~/.local/share/astra-build-env/trixie` | chroot |
 | `~/.config/astra-build-env/config` | путь к chroot |
-| `~/.local/opt/buildenv/ИМЯ` | установленные программы |
+| `~/.local/opt/buildenv/ИМЯ` | установленные программы (`.update` — откуда их обновлять) |
 | `~/.local/bin` | ссылки на них |
 | `~/.local/share/applications` | ярлыки |
 
 > **Не удаляйте и не переносите chroot**, пока установлены программы: путь к нему
-> прописан в их бинарниках. Обновлять пакеты внутри (`activate-build-env --root apt upgrade`)
-> можно.
+> прописан в их бинарниках. Обновлять пакеты внутри (`update-build-env --chroot`) можно.
 
 ## Как это работает
 

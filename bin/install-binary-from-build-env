@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 
 die()  { echo "install-binary-from-build-env: $*" >&2; exit 1; }
 warn() { echo "  ! $*" >&2; }
@@ -120,11 +120,16 @@ kind() {  # exe | lib | static | other
 check_name() { case "$1" in ""|*/*|.*) die "некорректное имя: '$1'" ;; esac; }
 
 list_apps() {
-  local d found=0
+  local d found=0 ver
   for d in "$OPT"/*/; do
     [ -d "$d" ] || continue
     found=1
-    echo "$(basename "$d")  ($(du -sh "$d" | cut -f1))"
+    ver=""
+    if [ -f "$d/.update" ]; then
+      ver=$(sed -n 's/^VERSION=//p' "$d/.update" | head -n1)
+      ver="  ${ver:-версия ?}, обновления: update-build-env"
+    fi
+    echo "$(basename "$d")  ($(du -sh "$d" | cut -f1))$ver"
     [ -f "$d/.links" ] && sed 's/^/    → /' "$d/.links"
   done
   [ "$found" = 1 ] || echo "Ничего не установлено."
@@ -150,21 +155,21 @@ remove_app() {
 
 NAME=""; TREE=""; GPU=0; STRIP=0; LINK=1; FORCE=0; LINKED=0
 DESKTOP=auto; TERMINAL=0; ICON=""; FIRST_EXEC=""; DESKTOPS=0
-FILES=(); EXTRA_LIBS=(); LINKS=(); ENVS=()
+FILES=(); EXTRA_LIBS=(); LINKS=(); ENVS=(); SAVE_OPTS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--name)  NAME=${2:?"--name требует значение"}; shift 2 ;;
     -t|--tree)  TREE=${2:?"--tree требует папку"}; shift 2 ;;
-    -L|--link)  LINKS+=("${2:?"--link требует путь"}"); shift 2 ;;
-    -l|--lib)   EXTRA_LIBS+=("${2:?"--lib требует файл"}"); shift 2 ;;
-    -e|--env)   ENVS+=("${2:?"--env требует VAR=ЗНАЧЕНИЕ"}"); shift 2 ;;
-    --gpu)      GPU=1; shift ;;
-    --strip)    STRIP=1; shift ;;
-    --no-link)  LINK=0; shift ;;
+    -L|--link)  LINKS+=("${2:?"--link требует путь"}"); SAVE_OPTS+=(--link "$2"); shift 2 ;;
+    -l|--lib)   EXTRA_LIBS+=("${2:?"--lib требует файл"}"); SAVE_OPTS+=(--lib "$(readlink -f "$2")"); shift 2 ;;
+    -e|--env)   ENVS+=("${2:?"--env требует VAR=ЗНАЧЕНИЕ"}"); SAVE_OPTS+=(--env "$2"); shift 2 ;;
+    --gpu)      GPU=1; SAVE_OPTS+=(--gpu); shift ;;
+    --strip)    STRIP=1; SAVE_OPTS+=(--strip); shift ;;
+    --no-link)  LINK=0; SAVE_OPTS+=(--no-link); shift ;;
     -f|--force) FORCE=1; shift ;;
-    --desktop)    DESKTOP=1; shift ;;
-    --no-desktop) DESKTOP=0; shift ;;
-    --terminal)   TERMINAL=1; shift ;;
+    --desktop)    DESKTOP=1; SAVE_OPTS+=(--desktop); shift ;;
+    --no-desktop) DESKTOP=0; SAVE_OPTS+=(--no-desktop); shift ;;
+    --terminal)   TERMINAL=1; SAVE_OPTS+=(--terminal); shift ;;
     --icon)       ICON=${2:?"--icon требует файл"}; shift 2 ;;
     -V|--version) echo "install-binary-from-build-env $VERSION"; exit 0 ;;
     --list)     list_apps; exit 0 ;;
@@ -488,7 +493,9 @@ if [ -n "$TREE" ]; then
   done
   echo "  пропатчено ELF-файлов: $patched"
 
-  [ -f "$APPDIR/.links" ] && cp "$APPDIR/.links" "$STAGE/.links"
+  for f in .links .update; do
+    if [ -f "$APPDIR/$f" ]; then cp "$APPDIR/$f" "$STAGE/$f"; fi
+  done
   if [ -d "$APPDIR" ]; then
     mv "$APPDIR" "$APPDIR.old.$$"
     mv "$STAGE" "$APPDIR"
@@ -537,6 +544,15 @@ if [ "$DESKTOP" != 0 ]; then
     else warn "нет исполняемого файла для ярлыка"
     fi
   fi
+fi
+
+# Параметры установки — для update-build-env (обновление с теми же параметрами)
+if [ -n "$TREE" ]; then
+  {
+    printf 'OPTS=('
+    for o in "${SAVE_OPTS[@]}"; do printf ' %q' "$o"; done
+    printf ' )\n'
+  } > "$APPDIR/.install-opts"
 fi
 
 if [ "$LINK" = 1 ] && [ "$LINKED" = 0 ]; then
