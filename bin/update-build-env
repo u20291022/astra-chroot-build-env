@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.1.0
+VERSION=1.1.2
 
 OPT=${BUILD_ENV_OPT:-$HOME/.local/opt/buildenv}
 BIN=${BUILD_ENV_BIN:-$HOME/.local/bin}
@@ -30,6 +30,7 @@ update-build-env — обновления программ, установлен
   update-build-env --track ИМЯ [ИСТОЧНИК] [--asset РЕГВЫР] [--version ВЕРСИЯ] [-- ПАРАМЕТРЫ]
                                       откуда брать обновления для программы
   update-build-env --untrack ИМЯ      больше не следить за программой
+  update-build-env --rollback ИМЯ     вернуть версию, стоявшую до последнего --install
   update-build-env --notify           тихая проверка с уведомлением (для автозапуска сеанса)
 
 ИСТОЧНИКИ
@@ -123,7 +124,7 @@ urldecode() { local s=${1//+/ }; printf '%b' "${s//%/\\x}"; }
 # $OPT/ИМЯ/.update:        SOURCE ASSET VERSION OPTS=(...)   (пишет update-build-env)
 # $OPT/ИМЯ/.install-opts:  OPTS=(...)                        (пишет install-binary-from-build-env 1.1+)
 load_meta() {  # ИМЯ
-  SOURCE=""; ASSET=""; INSTALLED=""; OPTS=()
+  SOURCE=""; ASSET=""; INSTALLED=""; OPTS=(); EXTRA=()
   local f=$OPT/$1/.update VERSION=""
   if [ -f "$f" ]; then
     # shellcheck disable=SC1090
@@ -141,6 +142,10 @@ save_meta() {  # ИМЯ
     printf 'VERSION=%q\n' "$INSTALLED"
     printf 'OPTS=('
     for o in "${OPTS[@]}"; do printf ' %q' "$o"; done
+    printf ' )\n'
+    printf '# файлы из chroot, которые кладутся в программу перед установкой (ПУТЬ_В_CHROOT=ПУТЬ_В_ПРОГРАММЕ)\n'
+    printf 'EXTRA=('
+    for o in "${EXTRA[@]}"; do printf ' %q' "$o"; done
     printf ' )\n'
   } > "$f.tmp.$$"
   mv -f "$f.tmp.$$" "$f"
@@ -193,6 +198,29 @@ derive_opts() {  # ИМЯ -> OPTS
   return 0
 }
 
+# Переменные вида @APP@/lib/X часто указывают на вспомогательные программы из chroot,
+# скопированные внутрь приложения (например, процессы WebKit для Tauri-приложений).
+# В файле релиза их нет, поэтому перед каждой установкой их нужно снова взять из chroot.
+detect_extra() {  # ИМЯ: OPTS -> EXTRA
+  local ch o rel b src prev=""
+  ch=$(chroot_path)
+  EXTRA=()
+  for o in "${OPTS[@]}"; do
+    if [ "$prev" = --env ]; then
+      case "$o" in
+        *=@APP@/*)
+          rel=${o#*=@APP@/}; rel=${rel%%:*}
+          b=$(basename "$rel")
+          for src in "/usr/lib/x86_64-linux-gnu/$b" "/usr/libexec/$b" "/usr/lib/$b"; do
+            if [ -e "$ch$src" ]; then EXTRA+=("$src=$rel"); break; fi
+          done ;;
+      esac
+    fi
+    prev=$o
+  done
+  return 0
+}
+
 # --- GitHub ------------------------------------------------------------------
 # latest_release ВЛАДЕЛЕЦ/РЕПО -> REL_TAG, REL_ASSETS (строки «имя<TAB>url»)
 latest_release() {
@@ -233,7 +261,7 @@ pick_asset() {  # РЕГВЫР|"" -> ASSET_NAME ASSET_URL
            '(amd64|x86_64).*\.AppImage$')
   fi
   for re in "${tries[@]}"; do
-    line=$(printf '%s\n' "$REL_ASSETS" | awk -F'\t' -v re="$re" '$1 ~ re && $1 !~ /\.(sha256|sha512|sig|asc|minisig|sbom|json|txt)$/ {print; exit}')
+    line=$(printf '%s\n' "$REL_ASSETS" | RE="$re" awk -F'\t' '$1 ~ ENVIRON["RE"] && $1 !~ /\.(sha256|sha512|sig|asc|minisig|sbom|json|txt)$/ {print; exit}')
     if [ -n "$line" ]; then
       ASSET_NAME=${line%%$'\t'*}; ASSET_URL=${line#*$'\t'}
       return 0
@@ -367,9 +395,14 @@ do_install() {
     tree=$(prepare_tree "$f" "$work/$name" "$name") || { warn "$name: не удалось распаковать"; continue; }
     rm -f "$f"
     [ ${#OPTS[@]} -gt 0 ] || derive_opts "$name"
+    [ ${#EXTRA[@]} -gt 0 ] || detect_extra "$name"
     printf '%s\n' "$REL_TAG" > "$work/$name/.tag"
     {
       printf 'echo; echo %q\n' "==> установка $name $REL_TAG"
+      for o in "${EXTRA[@]}"; do
+        printf 'mkdir -p %q && rm -rf %q && cp -a %q %q && echo %q\n' \
+          "$(dirname "$tree/${o#*=}")" "$tree/${o#*=}" "${o%%=*}" "$tree/${o#*=}" "  + ${o%%=*} из chroot"
+      done
       printf 'if install-binary-from-build-env --force'
       for o in "${OPTS[@]}"; do printf ' %q' "$o"; done
       printf ' --name %q --tree %q; then touch %q; fi\n' "$name" "$tree" "$work/$name/.ok"
@@ -381,6 +414,11 @@ do_install() {
 
   [ ${#todo[@]} -gt 0 ] || { rm -rf "$work"; die "нечего ставить"; }
   chmod +x "$run"
+  # Копия текущих версий на случай отката (жёсткие ссылки: почти не занимает места)
+  for name in "${todo[@]}"; do
+    rm -rf "$OPT/.$name.prev"
+    cp -al "$OPT/$name" "$OPT/.$name.prev" 2>/dev/null || cp -a "$OPT/$name" "$OPT/.$name.prev"
+  done
   echo; echo "${B}==> Установка через build-env${N} (sudo спросит пароль)"
   set +e
   (cd "$work" && activate-build-env bash "$run")
@@ -400,7 +438,10 @@ do_install() {
   done
   rm -rf "$work"
   echo
-  if [ ${#ok_names[@]} -gt 0 ]; then printf '%sОбновлено:%s %s\n' "$G" "$N" "$(IFS=,; echo "${ok_names[*]}" | sed 's/,/, /g')"; fi
+  if [ ${#ok_names[@]} -gt 0 ]; then
+    printf '%sОбновлено:%s %s\n' "$G" "$N" "$(IFS=,; echo "${ok_names[*]}" | sed 's/,/, /g')"
+    echo "Если новая версия работает хуже: update-build-env --rollback ИМЯ"
+  fi
   [ ${#ok_names[@]} -eq ${#todo[@]} ] && [ $rc -eq 0 ]
 }
 
@@ -436,9 +477,11 @@ do_track() {
     derive_opts "$name"
     if [ ${#OPTS[@]} -eq 0 ] && preset "$name"; then OPTS=("${P_OPTS[@]}"); fi
   fi
+  [ ${#EXTRA[@]} -gt 0 ] || detect_extra "$name"
   save_meta "$name"
   echo "$name: источник $SOURCE${ASSET:+, файл ~ /$ASSET/}"
   echo "  параметры установки: ${OPTS[*]:-(по умолчанию)}"
+  if [ ${#EXTRA[@]} -gt 0 ]; then echo "  из chroot при каждой установке: ${EXTRA[*]}"; fi
   echo "  установленная версия: ${INSTALLED:-неизвестна — первая же --install поставит последнюю}"
   if latest_release "$(source_repo "$SOURCE")"; then
     if pick_asset "$ASSET"; then echo "  последний релиз: $REL_TAG ($ASSET_NAME)"
@@ -447,6 +490,20 @@ do_track() {
   else
     warn "не удалось получить последний релиз — проверьте имя репозитория"
   fi
+}
+
+do_rollback() {
+  local name=${1:-} d p
+  check_name "$name"
+  d=$OPT/$name; p=$OPT/.$name.prev
+  [ -d "$p" ] || die "для '$name' нет сохранённой прошлой версии"
+  rm -rf "$d.rb.$$"
+  mv "$d" "$d.rb.$$"
+  mv "$p" "$d"
+  rm -rf "$d.rb.$$"
+  load_meta "$name"
+  echo "$name: возвращена прошлая версия (${INSTALLED:-?})"
+  echo "  чтобы update-build-env не предлагал обновление снова: update-build-env --untrack $name"
 }
 
 do_untrack() {
@@ -488,6 +545,7 @@ case "${1:-}" in
   --chroot)      do_chroot ;;
   --track)       shift; do_track "$@" ;;
   --untrack)     shift; do_untrack "${1:-}" ;;
+  --rollback)    shift; do_rollback "${1:-}" ;;
   --notify)      shift; do_notify "${1:-}" ;;
   -V|--version)  echo "update-build-env $VERSION" ;;
   -h|--help)     usage ;;
