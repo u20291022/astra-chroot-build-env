@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 # astra-get-gui — окно пакетного менеджера astra-get (PyQt5, есть в репозитории Astra:
 #   sudo apt install python3-pyqt5).
 # Все действия выполняет консольный astra-get; окно показывает его вывод.
@@ -17,7 +17,8 @@ try:
         QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
         QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 except ImportError:
-    sys.stderr.write("Нужен PyQt5: sudo apt install python3-pyqt5\n")
+    sys.stderr.write("Нужен PyQt5 для %s (%s): sudo apt install python3-pyqt5\n"
+                     % (sys.executable, sys.version.split()[0]))
     sys.exit(1)
 
 HERE = os.path.dirname(os.path.realpath(__file__))

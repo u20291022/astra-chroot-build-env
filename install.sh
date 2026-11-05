@@ -196,7 +196,7 @@ install_scripts() {
         die "не удалось скачать $s (ветка $REF репозитория $REPO)"
       fi
     fi
-    head -n1 "$BIN_DIR/$s.tmp" | grep -qE '^#!(/bin/bash|/usr/bin/env python3)' || { rm -f "$BIN_DIR/$s.tmp"; die "скачанный $s повреждён"; }
+    head -n1 "$BIN_DIR/$s.tmp" | grep -qE '^#!(/bin/bash|/usr/bin/env python3|/usr/bin/python3)' || { rm -f "$BIN_DIR/$s.tmp"; die "скачанный $s повреждён"; }
     chmod +x "$BIN_DIR/$s.tmp"
     mv -f "$BIN_DIR/$s.tmp" "$BIN_DIR/$s"
     ok "$s  ${src:+(из локальной копии)}"
@@ -212,7 +212,7 @@ install_gui() {
     warn "нет python3 — astra-get не заработает (sudo apt install python3)"
     return 0
   fi
-  if ! python3 -c 'import PyQt5.QtWidgets' >/dev/null 2>&1; then
+  if ! /usr/bin/python3 -c 'import PyQt5.QtWidgets' >/dev/null 2>&1; then
     info "Окну astra-get-gui нужен PyQt5 из репозитория Astra."
     if ask "Установить python3-pyqt5?" y; then
       if sudo apt-get install -y python3-pyqt5 >/dev/null 2>&1; then ok "python3-pyqt5"
