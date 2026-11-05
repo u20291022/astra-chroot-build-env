@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.2.0
+VERSION=1.2.1
 
 die()  { echo "install-binary-from-build-env: $*" >&2; exit 1; }
 warn() { echo "  ! $*" >&2; }
@@ -223,6 +223,7 @@ echo "Установка '$NAME' → $APPDIR"
 # --- Список ELF-файлов для анализа -------------------------------------------
 SCAN=()
 TREE_ELF=(); TREE_KIND=()
+declare -A TREE_NAMES=()
 if [ -n "$TREE" ]; then
   mkdir -p "$STAGE"
   cp -a "$TREE/." "$STAGE/"
@@ -233,6 +234,7 @@ if [ -n "$TREE" ]; then
       static)  TREE_ELF+=("$f"); TREE_KIND+=("$k") ;;
     esac
   done < <(find "$STAGE" -type f -print0)
+  while IFS= read -r -d '' f; do TREE_NAMES[$(basename "$f")]=1; done < <(find "$STAGE" \( -type f -o -type l \) -print0)
   [ ${#TREE_ELF[@]} -gt 0 ] \
     || die "в $TREE нет ни одного исполняемого ELF-файла — проверьте, что сборка и make install прошли без ошибок"
 else
@@ -269,7 +271,9 @@ scan() {
     line=${line#"${line%%[![:space:]]*}"}
     name=${line%% *}
     case "$line" in
-      *"=> not found"*) MISSING+=("${f#"$WORK"/}: $name") ;;
+      *"=> not found"*)
+        # библиотека лежит внутри самой программы (её найдёт RPATH исполняемого файла)
+        if [ -z "${TREE_NAMES[$name]:-}" ]; then MISSING+=("${f#"$WORK"/}: $name"); fi ;;
       *"=> /"*)
         path=${line#*=> }; path=${path% (*}
         if is_system "$path"; then add_dir "$(dirname "$path")"

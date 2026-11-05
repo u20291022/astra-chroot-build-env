@@ -74,6 +74,16 @@ wget -qO- https://raw.githubusercontent.com/u20291022/astra-chroot-build-env/mai
 | `deb:пакет` или просто имя пакета | ставит пакет Debian trixie в chroot и выводит программу на хост |
 | прямую ссылку на `.deb`/архив/AppImage | скачивает и ставит этот файл |
 
+Известные программы ставятся просто по имени:
+
+```bash
+astra-get install zed          # редактор Zed (Vulkan из chroot)
+astra-get install helium       # браузер Helium
+astra-get install python       # свежий CPython (python-build-standalone): команды python3.X и pip3.X
+astra-get install python@3.13  # конкретная версия; системный python3 не перекрывается
+astra-get install uv           # uv и uvx
+```
+
 ```bash
 astra-get install https://github.com/sharkdp/bat
 astra-get install helix-editor/helix --name helix

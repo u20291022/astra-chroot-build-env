@@ -11,6 +11,7 @@
 import argparse
 import hashlib
 import json
+import mmap
 import os
 import re
 import shlex
@@ -25,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -40,9 +41,40 @@ LIBDIRS = ["/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/usr/lib", "/l
 
 PRESETS = {  # известные программы: имя -> (источник, регулярка файла релиза)
     "zed": ("github:zed-industries/zed", r"^zed-linux-x86_64\.tar\.gz$"),
+    "helium": ("github:imputnet/helium-linux", r"x86_64_linux\.tar\.xz$"),
+    "uv": ("github:astral-sh/uv", r"^uv-x86_64-unknown-linux-gnu\.tar\.gz$"),
+    # готовый переносимый CPython (собран под glibc 2.17, работает и на Astra); только релизы X.Y.Z
+    "python": ("github:astral-sh/python-build-standalone",
+               r"^cpython-3\.\d+\.\d+\+\d+-x86_64-unknown-linux-gnu-install_only_stripped\.tar\.gz$"),
     "clash-verge": ("github:clash-verge-rev/clash-verge-rev", r"_amd64\.deb$"),
     "clash-verge-rev": ("github:clash-verge-rev/clash-verge-rev", r"_amd64\.deb$"),
 }
+
+
+def preset_for(word):
+    """'python@3.13' -> ('python', источник, регулярка) или None."""
+    base, _, ver = word.partition("@")
+    if base not in PRESETS:
+        return None
+    src, rx = PRESETS[base]
+    if base == "python" and ver:
+        if not re.match(r"^3\.\d+$", ver):
+            raise Fail("укажите версию Python как 3.13")
+        rx = rx.replace(r"3\.\d+\.", re.escape(ver) + r"\.", 1)
+    return (base if not ver else "%s%s" % (base, ver)), src, rx
+
+
+def preset_links(name, tree):
+    """Что выводить в ~/.local/bin для известных программ, если не всё подряд."""
+    if name.startswith("python"):
+        # только версионные команды: python3 в ~/.local/bin перекрыл бы системный и сломал программы Astra
+        bind = os.path.join(tree, "bin")
+        out = []
+        for f in sorted(os.listdir(bind)) if os.path.isdir(bind) else []:
+            if re.match(r"^(python|pip)3\.\d+$", f):
+                out.append("bin/" + f)
+        return out or None
+    return None
 
 IS_TTY = sys.stdout.isatty()
 JSON_MODE = False
@@ -193,7 +225,7 @@ def parse_spec(spec):
         return "url", s
     if re.match(r"^[\w.-]+/[\w.-]+$", s):
         return "github", s
-    if re.match(r"^[a-z0-9][a-z0-9+.-]*$", s):
+    if re.match(r"^[a-z0-9][a-z0-9+.-]*(@[0-9.]+)?$", s):
         return "name", s
     raise Fail("не понимаю, что ставить: %s" % spec)
 
@@ -279,7 +311,10 @@ def pick_assets(assets, regex=None):
         sc = score_asset(name)
         if sc is not None:
             out.append((sc, name, url))
-    out.sort(key=lambda t: (-t[0], len(t[1])))
+    if regex:  # несколько файлов под одну регулярку (разные версии) — самая новая первой
+        out.sort(key=lambda t: [int(x) for x in re.findall(r"\d+", t[1])][:4], reverse=True)
+    else:
+        out.sort(key=lambda t: (-t[0], len(t[1])))
     return out
 
 
@@ -334,6 +369,21 @@ def elf_info(path):
         return None
 
 
+def is_chromium(files):
+    """Chromium и всё, что на нём (Electron, браузеры на Chromium)."""
+    return bool({"chrome-sandbox", "chrome_sandbox", "v8_context_snapshot.bin", "snapshot_blob.bin"} & set(files)) or \
+        ("resources.pak" in files and ("icudtl.dat" in files or "libffmpeg.so" in files))
+
+
+def dlopens_gpu(path):
+    """Программы на wgpu/blade (Zed) грузят Vulkan через dlopen — ищем имя библиотеки в файле."""
+    try:
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            return m.find(b"libvulkan.so.1") >= 0 or m.find(b"libEGL.so.1") >= 0
+    except (OSError, ValueError):
+        return False
+
+
 def scan_tree(tree):
     """ELF-файлы дерева, их зависимости и признаки (GPU, WebKit, GTK, Qt, Electron)."""
     files, needed, exes = set(), set(), []
@@ -351,7 +401,8 @@ def scan_tree(tree):
                 exes.append(os.path.relpath(p, tree))
     feats = set()
     has = lambda *xs: any(any(n.startswith(x) for n in needed) for x in xs)
-    if has("libvulkan.so", "libGL.so", "libEGL.so", "libGLX", "libgbm.so", "libGLESv2"):
+    if has("libvulkan.so", "libGL.so", "libEGL.so", "libGLX", "libgbm.so", "libGLESv2") or \
+            any(dlopens_gpu(os.path.join(tree, e)) for e in exes):
         feats.add("gpu")
     if has("libwebkit2gtk-4.1.so"):
         feats.add("webkit41")
@@ -364,7 +415,7 @@ def scan_tree(tree):
     for q in ("5", "6"):
         if has("libQt%sCore.so" % q) and not any(f.startswith("libQt%sCore.so" % q) for f in files):
             feats.add("qt" + q)
-    if "chrome-sandbox" in files or ("resources.pak" in files and "libffmpeg.so" in files):
+    if is_chromium(files):
         feats.add("electron")
     return {"files": files, "needed": sorted(needed), "exes": sorted(exes), "feats": feats}
 
@@ -372,6 +423,8 @@ def scan_tree(tree):
 def missing_libs(scan, chroot):
     miss = []
     for so in scan["needed"]:
+        if "/" in so:  # NEEDED с путём ($ORIGIN/../lib/libpython3.so) — ищем файл внутри программы
+            so = so.rsplit("/", 1)[1]
         if so in scan["files"] or so.startswith("ld-linux"):
             continue
         if not any(os.path.exists(chroot + d + "/" + so) for d in LIBDIRS):
@@ -564,15 +617,32 @@ def desktop_execs(tree):
 def plan_links(tree, scan, name):
     """Что вывести в ~/.local/bin."""
     bind = os.path.join(tree, "bin")
-    execs = [e for e in desktop_execs(tree) if os.path.isfile(os.path.join(bind, e))]
-    if execs:
-        return ["bin/" + e for e in sorted(set(execs))]
+    out = []
+    for e in sorted(set(desktop_execs(tree))):
+        if os.path.isfile(os.path.join(bind, e)):
+            out.append("bin/" + e)
+        elif os.path.isfile(os.path.join(tree, e)) and os.access(os.path.join(tree, e), os.X_OK):
+            out.append(e)
+    if out:
+        return out
     if os.path.isdir(bind):
         return []  # по умолчанию: всё исполняемое из bin/
     # нет bin/: ELF-программы в корне или на уровень ниже
     top = [e for e in scan["exes"] if e.count("/") <= 1 and not e.startswith("lib")]
+    top = [e for e in top if not re.search(r"(chrome[-_]sandbox|crashpad|_handler$)", e)]
+    if len(top) <= 4:
+        return top
     pref = [e for e in top if os.path.basename(e).lower() in (name.lower(), name.lower().replace("-", ""))]
     return pref or top[:3]
+
+
+def userns_ok():
+    """Работают ли непривилегированные user namespaces (их использует песочница Chromium)."""
+    try:
+        return subprocess.call(["unshare", "-Ur", "true"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0
+    except OSError:
+        return False
 
 
 def detect_options(tree, scan, name, chroot):
@@ -600,14 +670,17 @@ def detect_options(tree, scan, name, chroot):
                  "--env", "GSETTINGS_SCHEMA_DIR=@CHROOT@/usr/share/glib-2.0/schemas",
                  "--env", "XDG_DATA_DIRS=@APP@/share:@CHROOT@/usr/share:/usr/local/share:/usr/share"]
         notes.append("GTK: модули, иконки и схемы из chroot")
-    for q in ("5", "6"):
+    for q in ("5", "6") if not ("qt5" in f and "qt6" in f) else ():
         if "qt" + q in f:
             opts += ["--env", "QT_PLUGIN_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/qt%s/plugins" % q,
                      "--env", "QML2_IMPORT_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/qt%s/qml" % q]
             notes.append("Qt%s: плагины из chroot" % q)
     if "electron" in f:
-        opts += ["--arg", "--no-sandbox"]
-        notes.append("Electron: запуск с --no-sandbox (песочница Chromium требует setuid)")
+        if userns_ok():
+            notes.append("Chromium/Electron: песочница через user namespaces работает")
+        else:
+            opts += ["--arg", "--no-sandbox"]
+            notes.append("Chromium/Electron: user namespaces выключены в ядре — запуск с --no-sandbox")
     return opts, extra, notes
 
 
@@ -692,6 +765,19 @@ def webkit_patch(job, scan):
     return [], None
 
 
+def drop_link_opts(opts):
+    out, skip = [], False
+    for o in opts:
+        if skip:
+            skip = False
+            continue
+        if o in ("--link", "-L"):
+            skip = True
+            continue
+        out.append(o)
+    return out
+
+
 def strip_lib_opts(opts):
     out, skip = [], False
     for o in opts:
@@ -744,25 +830,36 @@ def install_tree(job, tree, opts, extra, links, meta, tree_in_chroot=None, pre="
     save_meta(job.name, meta)
 
 
-def appimage_desktop(tree, name):
-    """Ярлык и иконка AppImage лежат в корне — переносим туда, где их ищет install-binary-from-build-env."""
+def root_desktop(tree, name, appimage=False):
+    """Ярлык и иконка лежат в корне архива или AppImage — переносим туда, где их ищет
+    install-binary-from-build-env (share/applications, share/pixmaps)."""
+    pngs = [f for f in os.listdir(tree) if re.search(r"\.(png|svg|xpm)$", f) and os.path.isfile(os.path.realpath(os.path.join(tree, f)))]
     for f in os.listdir(tree):
         p = os.path.join(tree, f)
-        if f.endswith(".desktop") and os.path.isfile(p):
-            os.makedirs(os.path.join(tree, "share/applications"), exist_ok=True)
-            lines = []
-            for line in open(p, encoding="utf-8", errors="replace"):
-                if line.startswith("Exec="):
-                    rest = line[5:].strip().split(None, 1)
-                    line = "Exec=%s%s\n" % (name, (" " + rest[1]) if len(rest) > 1 else "")
-                elif line.startswith("TryExec="):
-                    continue
-                lines.append(line)
-            with open(os.path.join(tree, "share/applications", f), "w") as o:
+        if not (f.endswith(".desktop") and os.path.isfile(p)):
+            continue
+        os.makedirs(os.path.join(tree, "share/applications"), exist_ok=True)
+        lines, icon = [], None
+        for line in open(p, encoding="utf-8", errors="replace"):
+            if line.startswith("Exec=") and appimage:
+                rest = line[5:].strip().split(None, 1)
+                line = "Exec=%s%s\n" % (name, (" " + rest[1]) if len(rest) > 1 else "")
+            elif line.startswith("TryExec="):
+                continue
+            elif line.startswith("Icon=") and icon is None:
+                icon = line[5:].strip()
+            lines.append(line)
+        dst = os.path.join(tree, "share/applications", f)
+        if not os.path.exists(dst):
+            with open(dst, "w") as o:
                 o.writelines(lines)
-        elif re.search(r"\.(png|svg|xpm)$", f) and os.path.isfile(os.path.realpath(p)):
-            os.makedirs(os.path.join(tree, "share/pixmaps"), exist_ok=True)
-            shutil.copy(os.path.realpath(p), os.path.join(tree, "share/pixmaps", f))
+        if icon and "/" not in icon:
+            pick = [x for x in pngs if os.path.splitext(x)[0] == icon] or \
+                sorted([x for x in pngs if "logo" in x or "icon" in x], key=lambda x: -os.path.getsize(os.path.join(tree, x)))
+            if pick:
+                os.makedirs(os.path.join(tree, "share/pixmaps"), exist_ok=True)
+                ext = os.path.splitext(pick[0])[1]
+                shutil.copy(os.path.realpath(os.path.join(tree, pick[0])), os.path.join(tree, "share/pixmaps", icon + ext))
 
 
 def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, regex="", source=None):
@@ -785,7 +882,7 @@ def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, rege
             link = os.path.join(tree, "bin", name)
             if not os.path.lexists(link):
                 os.symlink("../AppRun", link)
-            appimage_desktop(tree, name)
+            root_desktop(tree, name, appimage=True)
         return finish_tree_install(job, tree, source or "github:" + repo, rel["tag"], regex or "", prev_meta,
                                    depends=depends)
     except BaseException:
@@ -795,16 +892,28 @@ def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, rege
 
 def finish_tree_install(job, tree, source, version, asset_regex, prev_meta, extra_notes=(), cleanup=True,
                         depends=()):
+    names = set(os.listdir(tree))
+    if is_chromium(names):
+        for shim in ("libqt5_shim.so", "libqt6_shim.so"):  # необязательная тема Qt, тянет весь Qt
+            if shim in names:
+                os.remove(os.path.join(tree, shim))
+    if not os.path.isdir(os.path.join(tree, "share/applications")):
+        root_desktop(tree, job.name)
     scan = scan_tree(tree)
     if not scan["exes"]:
         raise Fail("в программе нет ни одного исполняемого ELF-файла")
+    if "gpu" in scan["feats"] and not os.path.isdir(job.chroot + "/usr/share/vulkan/icd.d"):
+        depends = list(depends) + [["mesa-vulkan-drivers"], ["libvulkan1"], ["libegl1"], ["libgl1-mesa-dri"]]
     resolve_missing(job, tree, scan, depends)
+    plinks = preset_links(job.name, tree)
     if prev_meta and prev_meta.get("OPTS"):
         opts, extra, notes = list(prev_meta["OPTS"]), list(prev_meta.get("EXTRA", [])), ["параметры прошлой установки"]
         links = []
+        if plinks:  # версия Python могла смениться — ссылки считаем заново
+            opts, links = drop_link_opts(opts), plinks
     else:
         opts, extra, notes = detect_options(tree, scan, job.name, job.chroot)
-        links = plan_links(tree, scan, job.name)
+        links = plinks or plan_links(tree, scan, job.name)
     for n in list(extra_notes) + notes:
         info(n)
     if extra:  # библиотеки WebKit должны быть в chroot до копирования
@@ -1236,6 +1345,10 @@ def cmd_install(a):
     kind, val = parse_spec(a.spec)
     if a.name:
         check_name(a.name)
+    if kind == "name" and preset_for(val):
+        pname, src, rx = preset_for(val)
+        info("известная программа: %s" % src)
+        return install_github(src.split(":", 1)[1], a.name or pname, a.asset or rx, a.source, a.force)
     if kind == "name":
         if chroot_candidate(chroot_path(), val) or chroot_dpkg_version(chroot_path(), val):
             kind = "debian"
@@ -1444,13 +1557,19 @@ def cmd_resolve(a):
     """Что будет установлено (для GUI и проверки перед установкой)."""
     kind, val = parse_spec(a.spec)
     r = {"spec": a.spec, "kind": kind, "target": val}
+    if kind == "name" and preset_for(val):
+        pname, src, rx = preset_for(val)
+        kind, r["kind"], r["target"] = "github", "github", src.split(":", 1)[1]
+        val, a.asset = r["target"], a.asset or rx
+        r["preset"] = pname
     if kind == "name":
         ch = chroot_path()
         if chroot_candidate(ch, val) or chroot_dpkg_version(ch, val):
             kind = r["kind"] = "debian"
     if kind == "github":
         rel = latest_release(val)
-        r["name"] = find_by_source("github:" + val) or find_by_source("github-src:" + val) or default_name(val)
+        r["name"] = r.get("preset") or find_by_source("github:" + val) or find_by_source("github-src:" + val) \
+            or default_name(val)
         if rel:
             cand = pick_assets(rel["assets"], a.asset)
             r["version"] = rel["tag"]
