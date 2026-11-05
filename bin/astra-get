@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.1.2"
+VERSION = "2.1.3"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -976,7 +976,7 @@ def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, rege
 
 
 def finish_tree_install(job, tree, source, version, asset_regex, prev_meta, extra_notes=(), cleanup=True,
-                        depends=()):
+                        depends=(), links_override=None):
     names = set(os.listdir(tree))
     if is_chromium(names):
         for shim in ("libqt5_shim.so", "libqt6_shim.so"):  # необязательная тема Qt, тянет весь Qt
@@ -991,7 +991,7 @@ def finish_tree_install(job, tree, source, version, asset_regex, prev_meta, extr
     if "gpu" in scan["feats"] and not os.path.isdir(job.chroot + "/usr/share/vulkan/icd.d"):
         depends = list(depends) + [["mesa-vulkan-drivers"], ["libvulkan1"], ["libegl1"], ["libgl1-mesa-dri"]]
     resolve_missing(job, tree, scan, depends)
-    plinks = preset_links(job.name, tree)
+    plinks = links_override or preset_links(job.name, tree)
     if prev_meta and prev_meta.get("OPTS"):
         opts, extra, notes = list(prev_meta["OPTS"]), list(prev_meta.get("EXTRA", [])), ["параметры прошлой установки"]
         links = []
@@ -1329,8 +1329,10 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
         script = os.path.join(job.work, ".deb.sh")
         with open(script, "w") as f:
             f.write("set -e\nexport DEBIAN_FRONTEND=noninteractive\napt-get update -qq\n"
-                    "apt-get install -y -q %s\ndpkg-query -W -f='${Version}' %s > .version\n"
-                    "dpkg -L %s > .files\n" % (q(pkg), q(pkg), q(pkg)))
+                    "echo '  apt-get install %s'\n"
+                    "apt-get install -y -qq -o Dpkg::Use-Pty=0 %s > .apt.out 2>&1 || { tail -n 30 .apt.out; exit 1; }\n"
+                    "dpkg-query -W -f='${Version}' %s > .version\n"
+                    "dpkg -L %s > .files\n" % (q(pkg), q(pkg), q(pkg), q(pkg)))
         run_env(["bash", script], root=True, cwd=job.work, log=job.log)
         version = open(os.path.join(job.work, ".version")).read().strip()
         files = [l.strip() for l in open(os.path.join(job.work, ".files")) if l.strip()]
@@ -1349,8 +1351,19 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
                 dst = os.path.join(tree, "share", m.group(1), m.group(2))
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(full, dst)
+        override = None
         if not n_bin:
-            raise Fail("в пакете %s нет программ в /usr/bin — это библиотека или данные?" % pkg)
+            # Серверы и инструменты со своим каталогом: /usr/lib/postgresql/18/bin, /usr/libexec/...
+            libbins = [p for p in files if re.match(r"^/usr/(lib|libexec)/.+/bin/[^/]+$", p)
+                       and os.path.isfile(job.chroot + p) and not os.path.islink(job.chroot + p)
+                       and os.access(job.chroot + p, os.X_OK)]
+            if not libbins:
+                raise Fail("в пакете %s нет программ — это библиотека или данные?" % pkg)
+            tree = os.path.join(job.work, "full")
+            copy_usr_tree(job.chroot, files, tree)
+            override = sorted(os.path.relpath(p, "/usr") for p in libbins)
+            info("программы не в /usr/bin: пакет копируется целиком с раскладкой /usr (%d команд)" % len(override))
+            host_links = False
         links = []
         if host_links:
             for p in files:
@@ -1371,7 +1384,8 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
             if made:
                 with open(os.path.join(job.work, ".host-links"), "w") as f:
                     f.write("\n".join(made) + "\n")
-        name = finish_tree_install(job, tree, "debian:" + pkg, version, "", prev_meta, meta_extra_notes, cleanup=False)
+        name = finish_tree_install(job, tree, "debian:" + pkg, version, "", prev_meta, meta_extra_notes, cleanup=False,
+                                   links_override=override)
         hl = os.path.join(job.work, ".host-links")
         if os.path.exists(hl):
             old = os.path.join(app_dir(name), ".host-links")
@@ -1383,6 +1397,27 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
     except BaseException:
         job.cleanup(keep=True)
         raise
+
+
+def copy_usr_tree(chroot, files, tree):
+    """Файлы пакета из /usr с сохранением раскладки: программы вроде PostgreSQL находят
+    свои lib/ и share/ относительно каталога bin, так что раскладку нужно повторить."""
+    for p in files:
+        if not p.startswith("/usr/") or re.match(r"^/usr/share/(doc|man|lintian|bug|info)/", p):
+            continue
+        src, dst = chroot + p, os.path.join(tree, os.path.relpath(p, "/usr"))
+        if os.path.islink(src):
+            t = os.readlink(src)
+            if t.startswith("/usr/"):
+                t = os.path.relpath(os.path.join(tree, os.path.relpath(t, "/usr")), os.path.dirname(dst))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if not os.path.lexists(dst):
+                os.symlink(t, dst)
+        elif os.path.isdir(src):
+            os.makedirs(dst, exist_ok=True)
+        elif os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
 
 
 def debian_search(q, limit=30):
