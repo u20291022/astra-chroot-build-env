@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.1.3"
+VERSION = "2.1.4"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -191,28 +191,57 @@ def gh_json(path):
     return json.loads(body.decode("utf-8"))
 
 
-def download(url, dest):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".part", "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done, last = 0, -1
-        while True:
-            chunk = r.read(1 << 16)
-            if not chunk:
+def download(url, dest, attempts=5):
+    """Скачивание с повторами и докачкой (Range): обрывы соединения и таймауты TLS
+    при нестабильной сети или VPN не начинают загрузку заново."""
+    part = dest + ".part"
+    if os.path.exists(part):
+        os.remove(part)
+    total, last = 0, -1
+    for attempt in range(attempts):
+        done = os.path.getsize(part) if os.path.exists(part) else 0
+        hdr = {"User-Agent": UA}
+        if done:
+            hdr["Range"] = "bytes=%d-" % done
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=60) as r:
+                if done and r.status != 206:  # сервер не умеет докачку — с начала
+                    done = 0
+                length = int(r.headers.get("Content-Length") or 0)
+                total = done + length if length else total
+                with open(part, "ab" if done else "wb") as f:
+                    while True:
+                        chunk = r.read(1 << 16)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            pct = done * 100 // total
+                            if pct != last and (pct % 5 == 0 or IS_TTY):
+                                last = pct
+                                progress(pct)
+                                if IS_TTY and not JSON_MODE:
+                                    sys.stdout.write("\r    скачано %3d%%  (%d МБ)" % (pct, total >> 20))
+                                    sys.stdout.flush()
+            if total and done < total:
+                raise OSError("соединение оборвалось на %d из %d МБ" % (done >> 20, total >> 20))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and done:  # уже всё скачано
                 break
-            f.write(chunk)
-            done += len(chunk)
-            if total:
-                pct = done * 100 // total
-                if pct != last and (pct % 5 == 0 or IS_TTY):
-                    last = pct
-                    progress(pct)
-                    if IS_TTY and not JSON_MODE:
-                        sys.stdout.write("\r    скачано %3d%%  (%d МБ)" % (pct, total >> 20))
-                        sys.stdout.flush()
+            raise
+        except (urllib.error.URLError, OSError) as e:
+            if attempt == attempts - 1:
+                raise urllib.error.URLError(getattr(e, "reason", e))
+            if IS_TTY and not JSON_MODE:
+                print()
+            warn("сеть: %s — повтор %d из %d%s" % (getattr(e, "reason", e), attempt + 2, attempts,
+                                                  ", докачиваю" if os.path.exists(part) and os.path.getsize(part) else ""))
+            time.sleep(3 * (attempt + 1))
     if IS_TTY and not JSON_MODE:
         print()
-    os.replace(dest + ".part", dest)
+    os.replace(part, dest)
 
 
 # --- GitHub -------------------------------------------------------------------------------
