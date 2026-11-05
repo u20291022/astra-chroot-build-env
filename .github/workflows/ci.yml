@@ -11,6 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck -S warning install.sh bin/activate-build-env bin/install-binary-from-build-env bin/update-build-env tests/hello/build.sh
+      - name: python (astra-get)
+        run: |
+          sudo apt-get install -y -q pyflakes3
+          pyflakes3 bin/astra-get bin/astra-get-gui bin/astra-get-askpass
+          python3 - <<'EOF'
+          import ast
+          for f in ("bin/astra-get", "bin/astra-get-gui", "bin/astra-get-askpass"):
+              ast.parse(open(f).read(), feature_version=(3, 7))  # Astra 1.7: python 3.7
+          EOF
 
   e2e:
     # glibc хоста (2.35) старше, чем в chroot: проверяем, что программа работает с glibc из chroot
@@ -41,6 +50,18 @@ jobs:
             exit 1
           fi
           test -f "$HOME/.local/share/applications/hello.desktop"
+
+      - name: astra-get install from GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          astra-get install sharkdp/bat
+          bat --version
+          astra-get list
+          astra-get update --check
+          astra-get remove bat
+          test ! -e "$HOME/.local/bin/bat"
 
       - name: remove and uninstall
         run: |

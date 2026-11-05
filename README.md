@@ -19,6 +19,15 @@
 ~/проект $ myprogram          # работает на хосте с glibc 2.41 из chroot
 ```
 
+А если собирать ничего не хочется — **astra-get**, пакетный менеджер поверх всего этого:
+
+```text
+$ astra-get install https://github.com/zed-industries/zed    # готовый релиз с GitHub
+$ astra-get install htop-dev/htop                            # нет релиза -> соберёт сам
+$ astra-get install deb:krita                                # пакет Debian trixie
+$ astra-get-gui                                              # то же в окне
+```
+
 ## Установка
 
 ```bash
@@ -27,7 +36,8 @@ wget -qO- https://raw.githubusercontent.com/u20291022/astra-chroot-build-env/mai
 
 Установщик:
 
-- кладёт `activate-build-env`, `install-binary-from-build-env` и `update-build-env` в `~/.local/bin`;
+- кладёт `activate-build-env`, `install-binary-from-build-env`, `update-build-env`, `astra-get`
+  и `astra-get-gui` в `~/.local/bin`, ярлык «astra-get» — в меню приложений;
 - создаёт chroot в `~/.local/share/astra-build-env/trixie` (≈300 МБ загрузки, 1–2 ГБ с пакетами);
 - ставит в него компиляторы и сборочные утилиты;
 - проводит короткий экскурс: собирает и устанавливает [btop](https://github.com/aristocratos/btop).
@@ -52,6 +62,58 @@ wget -qO- https://raw.githubusercontent.com/u20291022/astra-chroot-build-env/mai
 Требования: x86_64, `sudo`, `wget` или `curl`. На хосте не нужны ни git, ни компилятор.
 
 Повторный запуск установщика безопасен: он обновит скрипты и не тронет существующий chroot.
+
+## astra-get: установка в одну команду
+
+`astra-get` понимает три вида источников и сам выбирает, как ставить:
+
+| Что указать | Что произойдёт |
+|---|---|
+| ссылку на GitHub или `владелец/репозиторий` | берёт последний релиз и выбирает файл под Linux x86_64: `.deb`, архив, AppImage или бинарник |
+| то же, но релиза под Linux нет | клонирует исходники и собирает (cargo, go, meson, cmake, autotools, make) |
+| `deb:пакет` или просто имя пакета | ставит пакет Debian trixie в chroot и выводит программу на хост |
+| прямую ссылку на `.deb`/архив/AppImage | скачивает и ставит этот файл |
+
+```bash
+astra-get install https://github.com/sharkdp/bat
+astra-get install helix-editor/helix --name helix
+astra-get install htop-dev/htop                  # сборка из исходников
+astra-get install deb:mousepad
+astra-get search markdown                        # поиск в Debian и на GitHub
+astra-get resolve zed-industries/zed             # что будет поставлено, без установки
+astra-get list
+astra-get update                                 # проверить обновления
+astra-get update --all                           # поставить все
+astra-get rollback zed                           # вернуть прошлую версию
+astra-get remove bat
+astra-get track zed                              # подключить к обновлениям старую установку
+```
+
+Что astra-get делает сам, без подсказок:
+
+- **недостающие библиотеки** ищет по индексу пакетов Debian (`apt-file`) и ставит в chroot;
+  для `.deb` дополнительно ставит его зависимости — так находятся библиотеки, которые
+  программа грузит через `dlopen` (например, иконка в трее);
+- **при сборке из исходников** читает ошибки компилятора, `pkg-config`, `meson`, `cmake` и
+  `configure`, находит пакеты с нужными заголовками и повторяет сборку (до 8 попыток);
+- **GPU** (Vulkan/OpenGL) — `--gpu`; **GTK** — модули, схемы и иконки из chroot; **Qt** — плагины
+  из chroot; **Electron** — запуск с `--no-sandbox`;
+- **WebKitGTK** (Tauri-приложения): путь к процессам WebKit зашит в библиотеку, поэтому
+  программа получает копию `libwebkit2gtk` с путём, заменённым на ссылку `~/.abe/ID`;
+- **пакеты Debian**: копирует программы, ярлыки и иконки, данные оставляет в chroot. Если
+  программа ищет данные по жёсткому пути (`/usr/lib/x86_64-linux-gnu/mousepad`), создаёт на хосте
+  ссылку на каталог в chroot (через sudo, только если такого каталога на хосте нет; удаляется
+  вместе с программой). Отключить: `--no-host-links`.
+
+Окно `astra-get-gui` (нужен `python3-pyqt5` из репозитория Astra, установщик предложит его
+поставить): список установленного с обновлениями, поиск, установка по ссылке, журнал.
+Пароль sudo спрашивает отдельным окном; при входе по отпечатку сначала приложите палец.
+
+Ограничения: программы на Python и Node.js astra-get не собирает (для них есть `pipx`, `uv`,
+`npm`); GitHub без токена даёт 60 запросов API в час (`export GITHUB_TOKEN=...`), при нехватке
+astra-get читает страницы релизов напрямую.
+
+`update-build-env` по-прежнему работает, но `astra-get update` умеет больше источников.
 
 ## Использование
 

@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+# astra-get-askpass — окно пароля для sudo (SUDO_ASKPASS) при запуске из astra-get-gui.
+# sudo вызывает программу с текстом запроса и читает пароль из её вывода.
+import sys
+
+prompt = sys.argv[1] if len(sys.argv) > 1 else "Пароль:"
+try:
+    from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit
+except ImportError:
+    import subprocess
+    try:
+        sys.stdout.write(subprocess.check_output(["zenity", "--password", "--title=" + prompt]).decode())
+        sys.exit(0)
+    except (OSError, subprocess.CalledProcessError):
+        sys.exit(1)
+
+app = QApplication(sys.argv)
+text, ok = QInputDialog.getText(
+    None, "astra-get: нужны права администратора",
+    "Для установки в chroot нужен sudo.\n"
+    "Если включён вход по отпечатку, сначала приложите палец.\n\n" + prompt,
+    QLineEdit.Password)
+if not ok:
+    sys.exit(1)
+sys.stdout.write(text + "\n")

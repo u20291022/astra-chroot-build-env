@@ -148,7 +148,9 @@ uninstall() {
       done
     fi
   fi
-  rm -f "$BIN_DIR/activate-build-env" "$BIN_DIR/install-binary-from-build-env" "$BIN_DIR/update-build-env"
+  rm -f "$BIN_DIR/activate-build-env" "$BIN_DIR/install-binary-from-build-env" "$BIN_DIR/update-build-env" \
+    "$BIN_DIR/astra-get" "$BIN_DIR/astra-get-gui" "$BIN_DIR/astra-get-askpass" \
+    "$HOME/.local/share/applications/astra-get.desktop"
   rm -rf "$CONFIG_DIR" "$WORK_DIR"
   for f in "$HOME/.profile" "$HOME/.bashrc"; do
     [ -f "$f" ] && grep -qxF "$MARK" "$f" && sed -i "/^$MARK\$/,+1d" "$f"
@@ -185,7 +187,7 @@ install_scripts() {
   fi
   say "Установка скриптов в $BIN_DIR"
   mkdir -p "$BIN_DIR"
-  for s in activate-build-env install-binary-from-build-env update-build-env; do
+  for s in activate-build-env install-binary-from-build-env update-build-env astra-get astra-get-gui astra-get-askpass; do
     if [ -n "$src" ]; then
       cp "$src/$s" "$BIN_DIR/$s.tmp"
     else
@@ -194,11 +196,43 @@ install_scripts() {
         die "не удалось скачать $s (ветка $REF репозитория $REPO)"
       fi
     fi
-    head -n1 "$BIN_DIR/$s.tmp" | grep -q '^#!/bin/bash' || { rm -f "$BIN_DIR/$s.tmp"; die "скачанный $s повреждён"; }
+    head -n1 "$BIN_DIR/$s.tmp" | grep -qE '^#!(/bin/bash|/usr/bin/env python3)' || { rm -f "$BIN_DIR/$s.tmp"; die "скачанный $s повреждён"; }
     chmod +x "$BIN_DIR/$s.tmp"
     mv -f "$BIN_DIR/$s.tmp" "$BIN_DIR/$s"
     ok "$s  ${src:+(из локальной копии)}"
   done
+}
+
+install_gui() {
+  local apps=$HOME/.local/share/applications
+  say "Пакетный менеджер astra-get"
+  if command -v python3 >/dev/null 2>&1; then
+    ok "astra-get  (консоль: astra-get --help)"
+  else
+    warn "нет python3 — astra-get не заработает (sudo apt install python3)"
+    return 0
+  fi
+  if ! python3 -c 'import PyQt5.QtWidgets' >/dev/null 2>&1; then
+    info "Окну astra-get-gui нужен PyQt5 из репозитория Astra."
+    if ask "Установить python3-pyqt5?" y; then
+      if sudo apt-get install -y python3-pyqt5 >/dev/null 2>&1; then ok "python3-pyqt5"
+      else warn "не удалось, поставьте вручную: sudo apt install python3-pyqt5"; fi
+    fi
+  fi
+  mkdir -p "$apps"
+  cat > "$apps/astra-get.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=astra-get
+GenericName=Установка программ
+Comment=Свежие программы с GitHub и из Debian для Astra Linux
+Exec=$BIN_DIR/astra-get-gui %u
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;Settings;
+Keywords=install;github;package;программы;установка;
+DESKTOP
+  ok "ярлык «astra-get» в меню приложений"
 }
 
 ensure_path() {
@@ -322,6 +356,12 @@ ${B}Как пользоваться${N}
   update-build-env                                   ${Y}# есть ли обновления программ${N}
   update-build-env --install                         ${Y}# поставить обновления${N}
 
+${B}Проще всего — astra-get${N} (или окно astra-get-gui, в меню «astra-get»):
+  astra-get install https://github.com/sharkdp/bat   ${Y}# релиз с GitHub или сборка из исходников${N}
+  astra-get install deb:krita                        ${Y}# пакет Debian trixie${N}
+  astra-get search markdown                          ${Y}# поиск${N}
+  astra-get list | update | remove ИМЯ               ${Y}# установленное, обновления, удаление${N}
+
   Chroot: $CHROOT
   Не удаляйте его: установленные программы берут оттуда библиотеки.
 EOF
@@ -388,6 +428,7 @@ main_install() {
   case "$CHROOT/" in "$HOME/.local/bin/"*|"$OPT_DIR/"*) die "неподходящее место для chroot" ;; esac
 
   install_scripts
+  install_gui
   ensure_path
 
   if [ -x "$CHROOT/bin/bash" ]; then

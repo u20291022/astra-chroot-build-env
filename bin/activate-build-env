@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 
 usage() {
   cat <<'EOF'
@@ -49,7 +49,10 @@ if [ "$(id -u)" -ne 0 ]; then
     TI=$(mktemp /tmp/buildenv-terminfo.XXXXXX)
     infocmp -x "$TERM" > "$TI"
   fi
-  exec sudo TERM="${TERM:-xterm}" BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_ROOT="$ROOT_MODE" \
+  # Без терминала (GUI astra-get) пароль спрашивает программа из SUDO_ASKPASS
+  SUDO_A=()
+  if [ -n "${SUDO_ASKPASS:-}" ]; then SUDO_A=(-A); fi
+  exec sudo "${SUDO_A[@]}" TERM="${TERM:-xterm}" BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_ROOT="$ROOT_MODE" \
     BUILD_ENV_TERMINFO="$TI" "$(readlink -f "$0")" "$@"
 fi
 

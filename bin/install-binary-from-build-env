@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.1.0
+VERSION=1.2.0
 
 die()  { echo "install-binary-from-build-env: $*" >&2; exit 1; }
 warn() { echo "  ! $*" >&2; }
@@ -33,6 +33,8 @@ install-binary-from-build-env — установка программы из bui
   -l, --lib ФАЙЛ       добавить библиотеку, которую программа грузит через dlopen
   -e, --env VAR=ЗНАЧ   переменная в обёртке запуска (можно повторять);
                        @CHROOT@ заменяется путём к chroot, @APP@ папкой приложения
+  -a, --arg АРГУМЕНТ   аргумент, который обёртка всегда передаёт программе
+                       (например --no-sandbox для Electron), можно повторять
       --gpu            обёртка с драйверами Mesa/Vulkan из chroot
       --strip          удалить отладочную информацию (бинарник станет в разы меньше)
       --no-link        не создавать ссылки в ~/.local/bin
@@ -155,7 +157,7 @@ remove_app() {
 
 NAME=""; TREE=""; GPU=0; STRIP=0; LINK=1; FORCE=0; LINKED=0
 DESKTOP=auto; TERMINAL=0; ICON=""; FIRST_EXEC=""; DESKTOPS=0
-FILES=(); EXTRA_LIBS=(); LINKS=(); ENVS=(); SAVE_OPTS=()
+FILES=(); EXTRA_LIBS=(); LINKS=(); ENVS=(); ARGS=(); SAVE_OPTS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--name)  NAME=${2:?"--name требует значение"}; shift 2 ;;
@@ -163,6 +165,7 @@ while [ $# -gt 0 ]; do
     -L|--link)  LINKS+=("${2:?"--link требует путь"}"); SAVE_OPTS+=(--link "$2"); shift 2 ;;
     -l|--lib)   EXTRA_LIBS+=("${2:?"--lib требует файл"}"); SAVE_OPTS+=(--lib "$(readlink -f "$2")"); shift 2 ;;
     -e|--env)   ENVS+=("${2:?"--env требует VAR=ЗНАЧЕНИЕ"}"); SAVE_OPTS+=(--env "$2"); shift 2 ;;
+    -a|--arg)   ARGS+=("${2?"--arg требует значение"}"); SAVE_OPTS+=(--arg "$2"); shift 2 ;;
     --gpu)      GPU=1; SAVE_OPTS+=(--gpu); shift ;;
     --strip)    STRIP=1; SAVE_OPTS+=(--strip); shift ;;
     --no-link)  LINK=0; SAVE_OPTS+=(--no-link); shift ;;
@@ -351,7 +354,9 @@ write_wrapper() {  # LINK TARGET
       val=${val//@CHROOT@/$CHROOT}; val=${val//@APP@/$APPDIR}
       printf 'export %s=%q\n' "$var" "$val"
     done
-    printf 'exec %q "$@"\n' "$target"
+    printf 'exec %q' "$target"
+    for e in "${ARGS[@]}"; do printf ' %q' "$e"; done
+    printf ' "$@"\n'
   } > "$l"
   chmod +x "$l"
 }
@@ -370,7 +375,7 @@ make_link() {  # TARGET
       return 0
     fi
   fi
-  if [ "$GPU" = 1 ] || [ ${#ENVS[@]} -gt 0 ]; then
+  if [ "$GPU" = 1 ] || [ ${#ENVS[@]} -gt 0 ] || [ ${#ARGS[@]} -gt 0 ]; then
     write_wrapper "$l" "$target"
   else
     ln -s "$target" "$l"

@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+# astra-get-gui — окно пакетного менеджера astra-get (PyQt5, есть в репозитории Astra:
+#   sudo apt install python3-pyqt5).
+# Все действия выполняет консольный astra-get; окно показывает его вывод.
+# https://github.com/u20291022/astra-chroot-build-env
+
+import json
+import os
+import re
+import sys
+
+try:
+    from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, QTimer
+    from PyQt5.QtGui import QFont, QIcon
+    from PyQt5.QtWidgets import (
+        QAbstractItemView, QApplication, QComboBox, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
+        QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
+        QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+except ImportError:
+    sys.stderr.write("Нужен PyQt5: sudo apt install python3-pyqt5\n")
+    sys.exit(1)
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CLI = os.path.join(HERE, "astra-get")
+ASKPASS = os.path.join(HERE, "astra-get-askpass")
+
+KIND_TEXT = {
+    "release": "готовый релиз GitHub",
+    "source": "сборка из исходников GitHub",
+    "debian": "пакет Debian trixie",
+    "url": "файл по ссылке",
+    "unknown": "не найдено",
+}
+
+
+def source_text(src):
+    if not src:
+        return "—"
+    for p, t in (("github-src:", "исходники "), ("github:", "GitHub "), ("debian:", "Debian "), ("url:", "")):
+        if src.startswith(p):
+            return t + src[len(p):]
+    return src
+
+
+class Runner:
+    """Запуск astra-get в QProcess с разбором вывода."""
+
+    def __init__(self, win):
+        self.win = win
+        self.proc = None
+        self.buf = b""
+
+    def env(self):
+        e = QProcessEnvironment.systemEnvironment()
+        if os.access(ASKPASS, os.X_OK):
+            e.insert("SUDO_ASKPASS", ASKPASS)
+        e.insert("PYTHONUNBUFFERED", "1")
+        return e
+
+    def json_call(self, args, done):
+        """Короткая команда с --json: результат в done(obj или None, текст ошибки)."""
+        p = QProcess(self.win)
+        p.setProcessEnvironment(self.env())
+
+        def fin(code, _status):
+            out = bytes(p.readAllStandardOutput()).decode("utf-8", "replace").strip()
+            err = bytes(p.readAllStandardError()).decode("utf-8", "replace").strip()
+            obj = None
+            for line in reversed(out.splitlines()):
+                try:
+                    obj = json.loads(line)
+                    break
+                except ValueError:
+                    continue
+            if isinstance(obj, dict) and "error" in obj:
+                done(None, obj["error"])
+            elif obj is None:
+                done(None, err or "astra-get не ответил")
+            else:
+                done(obj, "")
+            p.deleteLater()
+        p.finished.connect(fin)
+        p.start(sys.executable, [CLI, "--json"] + args)
+
+    def long_call(self, args, title, done=None):
+        if self.proc:
+            QMessageBox.information(self.win, "astra-get", "Дождитесь окончания текущей операции.")
+            return
+        self.win.busy(True, title)
+        self.win.log_add("\n$ astra-get " + " ".join(args) + "\n")
+        p = QProcess(self.win)
+        p.setProcessEnvironment(self.env())
+        p.setProcessChannelMode(QProcess.MergedChannels)
+        self.proc, self.buf = p, b""
+
+        def out():
+            self.buf += bytes(p.readAllStandardOutput())
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                self.handle(line.decode("utf-8", "replace").replace("\r", ""))
+
+        def fin(code, _status):
+            out()
+            if self.buf:
+                self.handle(self.buf.decode("utf-8", "replace"))
+            self.proc = None
+            self.win.busy(False, "Готово" if code == 0 else "Ошибка — подробности в журнале")
+            if code != 0:
+                self.win.show_log(True)
+            if done:
+                done(code)
+            p.deleteLater()
+        p.readyReadStandardOutput.connect(out)
+        p.finished.connect(fin)
+        p.start(sys.executable, [CLI, "--progress-lines"] + args)
+
+    def handle(self, line):
+        m = re.match(r"^@@progress (\d+)", line)
+        if m:
+            self.win.progress.setRange(0, 100)
+            self.win.progress.setValue(int(m.group(1)))
+            return
+        if line.startswith("@@"):
+            return
+        if "Place your finger" in line or "Приложите палец" in line:
+            self.win.status.setText("sudo: приложите палец к сканеру или подождите окно пароля")
+        elif line.startswith("==> "):
+            self.win.status.setText(line[4:])
+            self.win.progress.setRange(0, 0)
+        self.win.log_add(line + "\n")
+
+
+class Main(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("astra-get — программы для Astra Linux")
+        self.setWindowIcon(QIcon.fromTheme("system-software-install"))
+        self.resize(980, 680)
+        self.run = Runner(self)
+        self.apps = []
+        self.updates = {}
+        self.resolved = None
+
+        root = QWidget()
+        lay = QVBoxLayout(root)
+
+        top = QHBoxLayout()
+        self.query = QLineEdit()
+        self.query.setPlaceholderText("Ссылка на GitHub, владелец/репозиторий, deb:пакет или слово для поиска")
+        self.query.returnPressed.connect(self.on_find)
+        self.find_btn = QPushButton("Найти")
+        self.find_btn.clicked.connect(self.on_find)
+        top.addWidget(self.query, 1)
+        top.addWidget(self.find_btn)
+        lay.addLayout(top)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.make_installed_tab(), "Установленные")
+        self.tabs.addTab(self.make_install_tab(), "Поиск и установка")
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        f = QFont("monospace")
+        f.setStyleHint(QFont.Monospace)
+        self.log.setFont(f)
+        self.log.setMaximumBlockCount(5000)
+
+        self.split = QSplitter(Qt.Vertical)
+        self.split.addWidget(self.tabs)
+        self.split.addWidget(self.log)
+        self.split.setSizes([500, 0])
+        lay.addWidget(self.split, 1)
+
+        bottom = QHBoxLayout()
+        self.status = QLabel("")
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(220)
+        self.progress.setVisible(False)
+        self.log_btn = QPushButton("Журнал")
+        self.log_btn.setCheckable(True)
+        self.log_btn.toggled.connect(self.show_log)
+        bottom.addWidget(self.status, 1)
+        bottom.addWidget(self.progress)
+        bottom.addWidget(self.log_btn)
+        lay.addLayout(bottom)
+
+        self.setCentralWidget(root)
+        QTimer.singleShot(0, self.refresh)
+
+    # --- вкладка «Установленные» -------------------------------------------------------
+    def make_installed_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Программа", "Версия", "Источник", "Обновление"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self.sync_buttons)
+        self.table.itemDoubleClicked.connect(lambda *_: self.on_run())
+        v.addWidget(self.table, 1)
+        h = QHBoxLayout()
+        self.b_check = QPushButton("Проверить обновления")
+        self.b_upall = QPushButton("Обновить всё")
+        self.b_up = QPushButton("Обновить")
+        self.b_rb = QPushButton("Откатить")
+        self.b_rm = QPushButton("Удалить")
+        self.b_run = QPushButton("Запустить")
+        self.b_check.clicked.connect(self.on_check)
+        self.b_upall.clicked.connect(self.on_update_all)
+        self.b_up.clicked.connect(self.on_update)
+        self.b_rb.clicked.connect(self.on_rollback)
+        self.b_rm.clicked.connect(self.on_remove)
+        self.b_run.clicked.connect(self.on_run)
+        for b in (self.b_check, self.b_upall):
+            h.addWidget(b)
+        h.addStretch(1)
+        for b in (self.b_run, self.b_up, self.b_rb, self.b_rm):
+            h.addWidget(b)
+        v.addLayout(h)
+        self.empty_hint = QLabel("Пока ничего не установлено. Вставьте сверху ссылку на GitHub или имя программы.")
+        self.empty_hint.setAlignment(Qt.AlignCenter)
+        self.empty_hint.setVisible(False)
+        v.addWidget(self.empty_hint)
+        return w
+
+    def selected_app(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        return self.apps[rows[0].row()]
+
+    def sync_buttons(self):
+        a = self.selected_app()
+        busy = self.run.proc is not None
+        for b in (self.b_up, self.b_rm):
+            b.setEnabled(bool(a) and not busy)
+        self.b_run.setEnabled(bool(a and a["commands"]) and not busy)
+        self.b_rb.setEnabled(bool(a and a["rollback"]) and not busy)
+        self.b_upall.setEnabled(any(u.get("update") for u in self.updates.values()) and not busy)
+        self.b_check.setEnabled(not busy)
+
+    def refresh(self):
+        self.run.json_call(["list"], self.got_list)
+
+    def got_list(self, obj, err):
+        if obj is None:
+            self.status.setText("Ошибка: " + err)
+            return
+        self.apps = obj
+        self.table.setRowCount(len(obj))
+        for i, a in enumerate(obj):
+            u = self.updates.get(a["name"], {})
+            if not a["source"]:
+                upd = "источник не задан"
+            elif u.get("error"):
+                upd = "ошибка проверки"
+            elif u.get("update"):
+                upd = "→ " + u["latest"]
+            elif u:
+                upd = "актуальная"
+            else:
+                upd = ""
+            for c, t in enumerate([a["name"], a["version"] or "?", source_text(a["source"]), upd]):
+                it = QTableWidgetItem(t)
+                if c == 3 and u.get("update"):
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                self.table.setItem(i, c, it)
+        self.empty_hint.setVisible(not obj)
+        self.sync_buttons()
+
+    def on_check(self):
+        self.busy(True, "Проверка обновлений…")
+        self.run.json_call(["update", "--check"], self.got_check)
+
+    def got_check(self, obj, err):
+        self.busy(False, "")
+        if obj is None:
+            self.status.setText("Ошибка проверки: " + err)
+            return
+        self.updates = {r["name"]: r for r in obj}
+        n = sum(1 for r in obj if r["update"])
+        self.status.setText("Доступно обновлений: %d" % n if n else "Все программы актуальны")
+        self.refresh()
+
+    def after_change(self, code):
+        self.updates = {}
+        self.refresh()
+        if code == 0:
+            QTimer.singleShot(100, self.on_check)
+
+    def on_update(self):
+        a = self.selected_app()
+        if a:
+            self.run.long_call(["update", a["name"]], "Обновление %s…" % a["name"], self.after_change)
+
+    def on_update_all(self):
+        self.run.long_call(["update", "--all"], "Обновление программ…", self.after_change)
+
+    def on_rollback(self):
+        a = self.selected_app()
+        if a and self.confirm("Вернуть %s к версии, стоявшей до последнего обновления?" % a["name"]):
+            self.run.long_call(["rollback", a["name"]], "Откат %s…" % a["name"], self.after_change)
+
+    def on_remove(self):
+        a = self.selected_app()
+        if a and self.confirm("Удалить %s?" % a["name"]):
+            self.run.long_call(["remove", a["name"]], "Удаление %s…" % a["name"], self.after_change)
+
+    def on_run(self):
+        a = self.selected_app()
+        if a and a["commands"]:
+            QProcess.startDetached(a["commands"][0], [])
+            self.status.setText("Запущено: " + os.path.basename(a["commands"][0]))
+
+    # --- вкладка «Поиск и установка» ---------------------------------------------------
+    def make_install_tab(self):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        self.results = QTreeWidget()
+        self.results.setHeaderLabels(["Программа", "Описание"])
+        self.results.setRootIsDecorated(False)
+        self.results.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.results.itemSelectionChanged.connect(self.on_result_selected)
+        h.addWidget(self.results, 3)
+
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        f = QFormLayout(card)
+        self.c_form = f
+        self.c_title = QLabel("Найдите программу: вставьте ссылку на GitHub или введите слово.")
+        self.c_title.setWordWrap(True)
+        tf = self.c_title.font()
+        tf.setBold(True)
+        self.c_title.setFont(tf)
+        f.addRow(self.c_title)
+        self.c_kind = QLabel("")
+        self.c_ver = QLabel("")
+        self.c_asset = QComboBox()
+        self.c_name = QLineEdit()
+        self.c_note = QLabel("")
+        self.c_note.setWordWrap(True)
+        f.addRow("Способ:", self.c_kind)
+        f.addRow("Версия:", self.c_ver)
+        f.addRow("Файл:", self.c_asset)
+        f.addRow("Имя:", self.c_name)
+        f.addRow(self.c_note)
+        self.c_install = QPushButton("Установить")
+        self.c_install.setEnabled(False)
+        self.c_install.clicked.connect(self.on_install)
+        self.c_source = QPushButton("Собрать из исходников")
+        self.c_source.setEnabled(False)
+        self.c_source.clicked.connect(lambda: self.on_install(source=True))
+        bh = QHBoxLayout()
+        bh.addWidget(self.c_install)
+        bh.addWidget(self.c_source)
+        f.addRow(bh)
+        h.addWidget(card, 2)
+        self.card_clear()
+        return w
+
+    def card_clear(self, title=None):
+        self.resolved = None
+        if title:
+            self.c_title.setText(title)
+        for wdg in (self.c_kind, self.c_ver, self.c_note):
+            wdg.setText("")
+        self.c_asset.clear()
+        self.c_asset.setEnabled(False)
+        self.set_asset_row(False)
+        self.c_name.setText("")
+        self.c_install.setEnabled(False)
+        self.c_source.setEnabled(False)
+
+    def set_asset_row(self, on):
+        self.c_asset.setVisible(on)
+        lbl = self.c_form.labelForField(self.c_asset)
+        if lbl:
+            lbl.setVisible(on)
+
+    def on_find(self):
+        q = self.query.text().strip()
+        if not q:
+            return
+        self.tabs.setCurrentIndex(1)
+        direct = re.match(r"^(https?://|github\.com/|deb:|debian:|github:)", q) or re.match(r"^[\w.-]+/[\w.-]+$", q)
+        self.results.clear()
+        if direct:
+            self.resolve(q)
+        else:
+            self.card_clear("Поиск «%s»…" % q)
+            self.busy(True, "Поиск…")
+            self.run.json_call(["search", q, "--limit", "15"], self.got_search)
+
+    def got_search(self, obj, err):
+        self.busy(False, "")
+        self.results.clear()
+        if obj is None:
+            self.card_clear("Ошибка поиска: " + err)
+            return
+        obj = sorted(obj, key=lambda r: r["kind"] != "github")  # сначала GitHub
+        for r in obj:
+            label = r["name"] + ("  ★%d" % r["stars"] if r.get("stars") else "")
+            it = QTreeWidgetItem([("Debian: " if r["kind"] == "debian" else "GitHub: ") + label, r["description"]])
+            it.setData(0, Qt.UserRole, r["spec"])
+            self.results.addTopLevelItem(it)
+        self.card_clear("Найдено: %d. Выберите программу слева." % len(obj) if obj else "Ничего не нашлось.")
+
+    def on_result_selected(self):
+        items = self.results.selectedItems()
+        if items:
+            self.resolve(items[0].data(0, Qt.UserRole))
+
+    def resolve(self, spec):
+        self.card_clear("Смотрю %s…" % spec)
+        self.busy(True, "Проверяю %s…" % spec)
+        self.run.json_call(["resolve", spec], self.got_resolve)
+
+    def got_resolve(self, r, err):
+        self.busy(False, "")
+        if r is None:
+            self.card_clear("Ошибка: " + err)
+            return
+        self.resolved = r
+        m = r.get("method", "unknown")
+        self.c_title.setText(r.get("target", r["spec"]))
+        self.c_kind.setText(KIND_TEXT.get(m, m))
+        self.c_ver.setText(r.get("version") or "последняя")
+        self.c_name.setText(r.get("name", ""))
+        if m == "release":
+            for a in r.get("assets", []):
+                self.c_asset.addItem(a["name"])
+            self.c_asset.setEnabled(self.c_asset.count() > 1)
+            self.set_asset_row(True)
+        notes = []
+        if m == "source":
+            notes.append("Готовой сборки под Linux нет. Программа будет собрана в chroot; недостающие "
+                         "пакеты для сборки astra-get найдёт и поставит сам. Это может занять время.")
+        elif m == "debian":
+            notes.append("Пакет ставится в chroot, программа выводится на хост. Для каталогов данных "
+                         "могут понадобиться ссылки в /usr/share (спросит sudo).")
+        elif m == "unknown":
+            sug = ", ".join(s["name"] for s in r.get("suggest", []))
+            notes.append("Не нашёл такой программы." + (" Похожие пакеты Debian: " + sug if sug else ""))
+        if r.get("installed"):
+            notes.append("Уже установлена — будет переустановлена.")
+        self.c_note.setText("\n".join(notes))
+        self.c_install.setEnabled(m in ("release", "source", "debian", "url"))
+        self.c_source.setEnabled(m == "release")
+
+    def on_install(self, source=False):
+        r = self.resolved
+        if not r:
+            return
+        spec = r["spec"]
+        if r["kind"] == "debian" and not spec.startswith(("deb:", "debian:")):
+            spec = "deb:" + r["target"]
+        args = ["install", spec]
+        name = self.c_name.text().strip()
+        if name:
+            args += ["--name", name]
+        if source:
+            args.append("--source")
+        elif r.get("method") == "release" and self.c_asset.currentIndex() > 0:
+            args += ["--asset", "^" + re.escape(self.c_asset.currentText()) + "$"]
+        if r.get("installed"):
+            args.append("--force")
+        self.run.long_call(args, "Установка %s…" % (name or spec), self.after_install)
+
+    def after_install(self, code):
+        self.refresh()
+        if code == 0:
+            self.tabs.setCurrentIndex(0)
+            self.status.setText("Установлено. Программа появилась в меню и в ~/.local/bin")
+
+    # --- общее --------------------------------------------------------------------------
+    def busy(self, on, text):
+        self.progress.setVisible(on)
+        if on:
+            self.progress.setRange(0, 0)
+        if text is not None:
+            self.status.setText(text)
+        self.find_btn.setEnabled(not on)
+        self.sync_buttons()
+
+    def show_log(self, on):
+        self.log_btn.blockSignals(True)
+        self.log_btn.setChecked(on)
+        self.log_btn.blockSignals(False)
+        self.split.setSizes([400, 260] if on else [500, 0])
+
+    def log_add(self, text):
+        self.log.moveCursor(self.log.textCursor().End)
+        self.log.insertPlainText(text)
+        self.log.ensureCursorVisible()
+
+    def confirm(self, text):
+        return QMessageBox.question(self, "astra-get", text) == QMessageBox.Yes
+
+    def closeEvent(self, ev):
+        if self.run.proc and not self.confirm("Идёт операция. Прервать и закрыть?"):
+            ev.ignore()
+            return
+        if self.run.proc:
+            self.run.proc.kill()
+        ev.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("astra-get")
+    app.setDesktopFileName("astra-get")
+    w = Main()
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        w.query.setText(sys.argv[1])
+        QTimer.singleShot(200, w.on_find)
+    w.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

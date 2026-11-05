@@ -1,0 +1,1598 @@
+#!/usr/bin/env python3
+# astra-get — пакетный менеджер для Astra Linux поверх astra-chroot-build-env.
+# https://github.com/u20291022/astra-chroot-build-env
+#
+# Ставит программы, собранные для современного Debian, на старую систему:
+#   astra-get install https://github.com/zed-industries/zed     готовый релиз GitHub
+#   astra-get install htop-dev/htop                             нет релиза -> сборка из исходников
+#   astra-get install deb:krita                                 пакет Debian trixie из chroot
+# Работает на python3 3.7 (Astra 1.7), только стандартная библиотека.
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+VERSION = "2.0.0"
+
+HOME = os.path.expanduser("~")
+OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
+BIN = os.environ.get("BUILD_ENV_BIN", os.path.join(HOME, ".local/bin"))
+APPS = os.environ.get("BUILD_ENV_APPS", os.path.join(HOME, ".local/share/applications"))
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "astra-get")
+GH_API = os.environ.get("ASTRA_GET_GH_API", "https://api.github.com").rstrip("/")
+GH_WEB = os.environ.get("ASTRA_GET_GH_WEB", "https://github.com").rstrip("/")
+UA = "astra-get/" + VERSION
+LIBDIRS = ["/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/usr/lib", "/lib", "/lib64",
+           "/usr/local/lib", "/usr/lib/x86_64-linux-gnu/pulseaudio"]
+
+PRESETS = {  # известные программы: имя -> (источник, регулярка файла релиза)
+    "zed": ("github:zed-industries/zed", r"^zed-linux-x86_64\.tar\.gz$"),
+    "clash-verge": ("github:clash-verge-rev/clash-verge-rev", r"_amd64\.deb$"),
+    "clash-verge-rev": ("github:clash-verge-rev/clash-verge-rev", r"_amd64\.deb$"),
+}
+
+IS_TTY = sys.stdout.isatty()
+JSON_MODE = False
+PROGRESS_LINES = False
+
+
+class Fail(Exception):
+    pass
+
+
+# --- Вывод -------------------------------------------------------------------------------
+def _c(code, s):
+    return "\033[%sm%s\033[0m" % (code, s) if IS_TTY else s
+
+
+def say(msg):
+    if not JSON_MODE:
+        print(_c("1", "==> " + msg), flush=True)
+
+
+def info(msg):
+    if not JSON_MODE:
+        print("    " + msg, flush=True)
+
+
+def ok(msg):
+    if not JSON_MODE:
+        print("    " + _c("32", "✓") + " " + msg, flush=True)
+
+
+def warn(msg):
+    print("    " + _c("33", "!") + " " + msg, file=sys.stderr, flush=True)
+
+
+def progress(pct):
+    if PROGRESS_LINES:
+        print("@@progress %d" % pct, flush=True)
+
+
+# --- Окружение build-env -----------------------------------------------------------------
+def chroot_path():
+    c = os.environ.get("BUILD_ENV_CHROOT", "")
+    cfg = os.path.join(HOME, ".config/astra-build-env/config")
+    if not c and os.path.isfile(cfg):
+        for line in open(cfg, encoding="utf-8", errors="replace"):
+            if line.startswith("CHROOT="):
+                c = line.split("=", 1)[1].strip().strip("'\"")
+    return (c or os.path.join(HOME, ".local/share/astra-build-env/trixie")).rstrip("/")
+
+
+def tool(name):
+    p = os.path.join(BIN, name)
+    if os.access(p, os.X_OK):
+        return p
+    p = shutil.which(name)
+    if not p:
+        raise Fail("не найден %s — установите astra-chroot-build-env (install.sh)" % name)
+    return p
+
+
+def run_env(args, root=False, cwd=None, log=None, check=True):
+    """Команда внутри chroot (activate-build-env). Вывод — в консоль и в лог."""
+    cmd = [tool("activate-build-env")] + (["--root"] if root else []) + list(args)
+    env = dict(os.environ)
+    if os.environ.get("SUDO_ASKPASS"):
+        env["BUILD_ENV_SUDO_ASKPASS"] = "1"
+    out = open(log, "ab") if log else None
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL if os.environ.get("SUDO_ASKPASS") else None,
+                             start_new_session=bool(os.environ.get("SUDO_ASKPASS")))
+        for line in iter(p.stdout.readline, b""):
+            if out:
+                out.write(line)
+            if not JSON_MODE:
+                sys.stdout.write("      " + line.decode("utf-8", "replace"))
+                sys.stdout.flush()
+        rc = p.wait()
+    finally:
+        if out:
+            out.close()
+    if check and rc != 0:
+        raise Fail("команда в build-env завершилась с ошибкой (%d): %s" % (rc, " ".join(args[:3])))
+    return rc
+
+
+def host_sudo(args):
+    sudo = ["sudo", "-A"] if os.environ.get("SUDO_ASKPASS") else ["sudo"]
+    return subprocess.call(sudo + list(args))
+
+
+# --- Сеть ----------------------------------------------------------------------------------
+def http_get(url, api=False, data_limit=None):
+    hdr = {"User-Agent": UA}
+    if api:
+        hdr["Accept"] = "application/vnd.github+json"
+        if os.environ.get("GITHUB_TOKEN"):
+            hdr["Authorization"] = "Bearer " + os.environ["GITHUB_TOKEN"]
+    req = urllib.request.Request(url, headers=hdr)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read(data_limit) if data_limit else r.read(), r.geturl()
+
+
+def gh_json(path):
+    body, _ = http_get(GH_API + path, api=True)
+    return json.loads(body.decode("utf-8"))
+
+
+def download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".part", "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done, last = 0, -1
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                pct = done * 100 // total
+                if pct != last and (pct % 5 == 0 or IS_TTY):
+                    last = pct
+                    progress(pct)
+                    if IS_TTY and not JSON_MODE:
+                        sys.stdout.write("\r    скачано %3d%%  (%d МБ)" % (pct, total >> 20))
+                        sys.stdout.flush()
+    if IS_TTY and not JSON_MODE:
+        print()
+    os.replace(dest + ".part", dest)
+
+
+# --- GitHub -------------------------------------------------------------------------------
+def parse_spec(spec):
+    """-> ('github', 'owner/repo') | ('debian', 'pkg') | ('url', url) | ('name', word)"""
+    s = spec.strip()
+    for p in ("deb:", "debian:"):
+        if s.startswith(p):
+            return "debian", s[len(p):]
+    if s.startswith("github:"):
+        return "github", s[7:].strip("/")
+    m = re.match(r"^(?:https?://)?(?:www\.)?github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/.*)?$", s)
+    if m:
+        if "/releases/download/" in s:
+            return "url", s if s.startswith("http") else "https://" + s
+        return "github", "%s/%s" % (m.group(1), m.group(2))
+    if re.match(r"^https?://", s):
+        return "url", s
+    if re.match(r"^[\w.-]+/[\w.-]+$", s):
+        return "github", s
+    if re.match(r"^[a-z0-9][a-z0-9+.-]*$", s):
+        return "name", s
+    raise Fail("не понимаю, что ставить: %s" % spec)
+
+
+def latest_release(repo):
+    """-> dict(tag, assets=[(name,url)]) или None, если релизов нет."""
+    try:
+        j = gh_json("/repos/%s/releases/latest" % repo)
+        return {"tag": j["tag_name"], "assets": [(a["name"], a["browser_download_url"]) for a in j.get("assets", [])]}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            try:  # репозиторий есть, релизов нет?
+                gh_json("/repos/%s" % repo)
+                return None
+            except urllib.error.HTTPError as e2:
+                if e2.code == 404:
+                    raise Fail("репозиторий %s не найден на GitHub" % repo)
+    except (urllib.error.URLError, ValueError, KeyError):
+        pass
+    # запасной путь без API (лимит 60 запросов в час): страница релиза
+    try:
+        _, final = http_get(GH_WEB + "/%s/releases/latest" % repo, data_limit=1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise Fail("GitHub не отвечает (%s); задайте GITHUB_TOKEN, если кончился лимит запросов" % e)
+    except urllib.error.URLError as e:
+        raise Fail("нет связи с GitHub: %s" % e)
+    m = re.search(r"/releases/tag/([^/?#]+)", final)
+    if not m:
+        return None
+    tag = urllib.parse.unquote(m.group(1))
+    body, _ = http_get(GH_WEB + "/%s/releases/expanded_assets/%s" % (repo, m.group(1)))
+    assets = []
+    for href in sorted(set(re.findall(r'href="([^"]*/releases/download/[^"]+)"', body.decode("utf-8", "replace")))):
+        url = GH_WEB + href if href.startswith("/") else href
+        assets.append((urllib.parse.unquote(url.rsplit("/", 1)[1]), url))
+    return {"tag": tag, "assets": assets}
+
+
+BAD_EXT = re.compile(r"\.(sha\d*|sha\d+sum|md5|sig|asc|minisig|pem|crt|sbom|spdx|json|txt|yml|yaml|blockmap|"
+                     r"pdb|sym|dmg|pkg|exe|msi|msix|apk|ipa|rpm|zsync|b3|nupkg|vsix|whl|snap|flatpak)$", re.I)
+BAD_TOK = re.compile(r"(windows|win32|win64|\bwin\b|darwin|macos|\bmac\b|osx|apple|android|\bios\b|freebsd|openbsd|"
+                     r"netbsd|aarch64|arm64|armv\d|armhf|armel|\barm\b|i[3-6]86|\b386\b|x86(?!_64|-64)|riscv|ppc|"
+                     r"powerpc|s390|loong|mips|source|\bsrc\b|debug|dbg|symbols)", re.I)
+
+
+def score_asset(name):
+    n = name.lower()
+    if BAD_EXT.search(n) or BAD_TOK.search(n.replace("x86_64", "x64").replace("x86-64", "x64")):
+        return None
+    linux = "linux" in n
+    arch = bool(re.search(r"(x86_64|x86-64|amd64|x64)", n))
+    s = 0
+    if n.endswith(".deb"):
+        s += 6
+    elif re.search(r"\.(tar\.gz|tgz|tar\.xz|txz|tar\.bz2|tbz2?|tar)$", n):
+        s += 4
+    elif n.endswith(".appimage"):
+        s += 3
+    elif n.endswith(".zip"):
+        s += 2
+    elif "." not in n.rsplit("-", 1)[-1] or re.search(r"(linux|amd64|x86_64)$", n):
+        s += 1   # одиночный бинарник
+    else:
+        return None
+    if not (linux or n.endswith(".deb") or n.endswith(".appimage")):
+        return None
+    s += 3 if arch else -1
+    s += 1 if linux else 0
+    s += 1 if "musl" in n or "static" in n else 0
+    return s
+
+
+def pick_assets(assets, regex=None):
+    """-> отсортированный список (score, name, url), лучший первым."""
+    out = []
+    for name, url in assets:
+        if regex:
+            if re.search(regex, name):
+                out.append((10, name, url))
+            continue
+        sc = score_asset(name)
+        if sc is not None:
+            out.append((sc, name, url))
+    out.sort(key=lambda t: (-t[0], len(t[1])))
+    return out
+
+
+# --- ELF без внешних утилит ----------------------------------------------------------------
+def elf_info(path):
+    """-> (needed: list, is_exe: bool) или None, если не ELF x86_64."""
+    try:
+        with open(path, "rb") as f:
+            ident = f.read(64)
+            if len(ident) < 64 or ident[:4] != b"\x7fELF" or ident[4] != 2 or ident[5] != 1:
+                return None
+            phoff, = struct.unpack_from("<Q", ident, 0x20)
+            phentsize, phnum = struct.unpack_from("<HH", ident, 0x36)
+            f.seek(phoff)
+            ph = f.read(phentsize * phnum)
+            loads, dyn, interp = [], None, False
+            for i in range(phnum):
+                p_type, _, p_offset, p_vaddr, _, p_filesz = struct.unpack_from("<IIQQQQ", ph, i * phentsize)
+                if p_type == 1:
+                    loads.append((p_vaddr, p_offset, p_filesz))
+                elif p_type == 2:
+                    dyn = (p_offset, p_filesz)
+                elif p_type == 3:
+                    interp = True
+            if not dyn:
+                return [], interp
+            f.seek(dyn[0])
+            d = f.read(dyn[1])
+            needed, strtab = [], None
+            for i in range(0, len(d) - 15, 16):
+                tag, val = struct.unpack_from("<qQ", d, i)
+                if tag == 0:
+                    break
+                if tag == 1:
+                    needed.append(val)
+                elif tag == 5:
+                    strtab = val
+            if strtab is None:
+                return [], interp
+            base = None
+            for va, off, sz in loads:
+                if va <= strtab < va + sz:
+                    base = strtab - va + off
+            if base is None:
+                return [], interp
+            names = []
+            for o in needed:
+                f.seek(base + o)
+                names.append(f.read(256).split(b"\0", 1)[0].decode("ascii", "replace"))
+            return names, interp
+    except (OSError, struct.error):
+        return None
+
+
+def scan_tree(tree):
+    """ELF-файлы дерева, их зависимости и признаки (GPU, WebKit, GTK, Qt, Electron)."""
+    files, needed, exes = set(), set(), []
+    for dp, dn, fn in os.walk(tree):
+        for n in fn:
+            p = os.path.join(dp, n)
+            files.add(n)
+            if os.path.islink(p) or not os.path.isfile(p):
+                continue
+            e = elf_info(p)
+            if e is None:
+                continue
+            needed.update(e[0])
+            if e[1] and os.access(p, os.X_OK):
+                exes.append(os.path.relpath(p, tree))
+    feats = set()
+    has = lambda *xs: any(any(n.startswith(x) for n in needed) for x in xs)
+    if has("libvulkan.so", "libGL.so", "libEGL.so", "libGLX", "libgbm.so", "libGLESv2"):
+        feats.add("gpu")
+    if has("libwebkit2gtk-4.1.so"):
+        feats.add("webkit41")
+    elif has("libwebkit2gtk-4.0.so"):
+        feats.add("webkit40")
+    elif has("libwebkitgtk-6.0.so"):
+        feats.add("webkit6")
+    if has("libgtk-3.so", "libgtk-4.so", "libgdk_pixbuf"):
+        feats.add("gtk")
+    for q in ("5", "6"):
+        if has("libQt%sCore.so" % q) and not any(f.startswith("libQt%sCore.so" % q) for f in files):
+            feats.add("qt" + q)
+    if "chrome-sandbox" in files or ("resources.pak" in files and "libffmpeg.so" in files):
+        feats.add("electron")
+    return {"files": files, "needed": sorted(needed), "exes": sorted(exes), "feats": feats}
+
+
+def missing_libs(scan, chroot):
+    miss = []
+    for so in scan["needed"]:
+        if so in scan["files"] or so.startswith("ld-linux"):
+            continue
+        if not any(os.path.exists(chroot + d + "/" + so) for d in LIBDIRS):
+            miss.append(so)
+    return miss
+
+
+# --- Пакеты в chroot -----------------------------------------------------------------------
+APT_SEARCH_FUNCS = r'''
+export DEBIAN_FRONTEND=noninteractive
+ensure_apt_file() {
+  command -v apt-file >/dev/null || apt-get install -y -q apt-file >/dev/null
+  ls /var/lib/apt/lists/*Contents* >/dev/null 2>&1 || apt-file update >/dev/null
+}
+# find_pkg РЕГВЫР [-i] -> имя пакета (предпочтительно -dev для заголовков)
+find_pkg() {
+  apt-file search $2 -x "$1" 2>/dev/null | cut -d: -f1 | sort -u \
+    | awk '{ print ($0 ~ /-dev$/ ? 0 : 1), length($0), $0 }' | sort -n | head -n1 | cut -d" " -f3
+}
+'''
+
+
+def deb_depends(path):
+    """Зависимости из control .deb: [[альтернатива, ...], ...] — для библиотек, которые
+    программа грузит через dlopen (их нет в DT_NEEDED)."""
+    try:
+        dep = subprocess.check_output(["dpkg-deb", "-f", path, "Depends"]).decode("utf-8", "replace")
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    out = []
+    for group in dep.split(","):
+        alts = [re.sub(r"[\s(:].*$", "", a.strip()) for a in group.split("|")]
+        alts = [a for a in alts if re.match(r"^[a-z0-9][a-z0-9+.-]+$", a)]
+        if alts:
+            out.append(alts)
+    return out
+
+
+def apt_install_for(patterns, workdir, log, update=True, groups=()):
+    """patterns: [(описание, регвыр, флаги)] -> ставит найденные пакеты в chroot. -> {описание: пакет}
+    groups: [[пакет | альтернатива ...]] — поставить первый доступный в trixie из каждой группы."""
+    if not patterns and not groups:
+        return {}
+    res = os.path.join(workdir, ".apt-found")
+    lines = [APT_SEARCH_FUNCS, "set -e", "cd %s" % shlex.quote(workdir)]
+    if update:
+        lines.append("apt-get update -qq || true")
+    lines += ["ensure_apt_file", ": > .apt-found", "pk=()"]
+    for desc, rx, flags in patterns:
+        lines.append('p=$(find_pkg %s %s); if [ -n "$p" ]; then printf "%%s\\t%%s\\n" %s "$p" >> .apt-found; pk+=("$p"); fi'
+                     % (shlex.quote(rx), flags, shlex.quote(desc)))
+    for g in groups:
+        lines.append('for n in %s; do if dpkg -s "$n" >/dev/null 2>&1; then break; fi; '
+                     'if apt-get install -s -qq "$n" >/dev/null 2>&1; then pk+=("$n"); '
+                     'printf "%%s\\t%%s\\n" "dep:$n" "$n" >> .apt-found; break; fi; done'
+                     % " ".join(shlex.quote(x) for x in g))
+    lines.append('if [ ${#pk[@]} -gt 0 ]; then echo "  apt-get install ${pk[*]}"; '
+                 'apt-get install -y -qq -o Dpkg::Use-Pty=0 --no-install-recommends "${pk[@]}" > .apt.out 2>&1 '
+                 '|| { tail -n 30 .apt.out; exit 1; }; fi')
+    script = os.path.join(workdir, ".apt.sh")
+    with open(script, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    run_env(["bash", script], root=True, cwd=workdir, log=log)
+    found = {}
+    if os.path.exists(res):
+        for line in open(res):
+            if "\t" in line:
+                d, p = line.rstrip("\n").split("\t", 1)
+                found[d] = p
+    return found
+
+
+def so_regex(so):
+    return r"^/(usr/)?lib(64)?/(x86_64-linux-gnu/)?" + re.escape(so) + "$"
+
+
+# --- Метаданные приложения (совместимы с update-build-env) ---------------------------------
+def app_dir(name):
+    return os.path.join(OPT, name)
+
+
+def check_name(name):
+    if not name or "/" in name or name.startswith(".") or not re.match(r"^[\w.+-]+$", name):
+        raise Fail("некорректное имя: %r" % name)
+
+
+def load_meta(name):
+    """Читает .update (формат bash) через сам bash — надёжнее, чем разбирать кавычки."""
+    m = {"SOURCE": "", "ASSET": "", "VERSION": "", "OPTS": [], "EXTRA": []}
+    f = os.path.join(app_dir(name), ".update")
+    if os.path.isfile(f):
+        code = ('OPTS=(); EXTRA=(); . "$1"; printf "%s\\0" "$SOURCE" "$ASSET" "$VERSION"; '
+                'printf "%s\\0" "${#OPTS[@]}" "${OPTS[@]}" "${#EXTRA[@]}" "${EXTRA[@]}"')
+        try:
+            out = subprocess.check_output(["bash", "-c", code, "x", f]).decode("utf-8", "replace").split("\0")
+            m["SOURCE"], m["ASSET"], m["VERSION"] = out[0], out[1], out[2]
+            n = int(out[3])
+            m["OPTS"] = out[4:4 + n]
+            k = int(out[4 + n])
+            m["EXTRA"] = out[5 + n:5 + n + k]
+        except (subprocess.CalledProcessError, ValueError, IndexError):
+            warn("%s: не удалось прочитать %s" % (name, f))
+    return m
+
+
+def save_meta(name, m):
+    q = shlex.quote
+    with open(os.path.join(app_dir(name), ".update.tmp"), "w") as f:
+        f.write("# astra-get: откуда обновлять эту программу\n")
+        f.write("SOURCE=%s\nASSET=%s\nVERSION=%s\n" % (q(m["SOURCE"]), q(m.get("ASSET", "")), q(m.get("VERSION", ""))))
+        f.write("OPTS=( %s )\n" % " ".join(q(o) for o in m.get("OPTS", [])))
+        f.write("# файлы из chroot, которые кладутся в программу перед установкой\n")
+        f.write("EXTRA=( %s )\n" % " ".join(q(o) for o in m.get("EXTRA", [])))
+    os.replace(os.path.join(app_dir(name), ".update.tmp"), os.path.join(app_dir(name), ".update"))
+
+
+def installed():
+    if not os.path.isdir(OPT):
+        return []
+    return sorted(d for d in os.listdir(OPT) if not d.startswith(".") and os.path.isdir(os.path.join(OPT, d)))
+
+
+def find_by_source(source):
+    for n in installed():
+        if load_meta(n)["SOURCE"] == source:
+            return n
+    return None
+
+
+# --- Подготовка дерева программы -------------------------------------------------------------
+def extract(path, dest, name):
+    """Распаковывает файл релиза в dest; -> корень дерева программы."""
+    os.makedirs(dest, exist_ok=True)
+    low = path.lower()
+    if low.endswith(".deb"):
+        subprocess.check_call(["dpkg-deb", "-x", path, dest])
+        if os.path.isdir(os.path.join(dest, "usr/bin")) or os.path.isdir(os.path.join(dest, "usr/lib")):
+            return os.path.join(dest, "usr")
+        opt = os.path.join(dest, "opt")
+        if os.path.isdir(opt) and len(os.listdir(opt)) == 1:
+            root = os.path.join(opt, os.listdir(opt)[0])
+            for sub in ("applications", "icons", "pixmaps"):  # ярлык и иконки лежат вне /opt
+                s = os.path.join(dest, "usr/share", sub)
+                if os.path.isdir(s) and not os.path.exists(os.path.join(root, "share", sub)):
+                    shutil.copytree(s, os.path.join(root, "share", sub), symlinks=True)
+            return root
+        return dest
+    if re.search(r"\.(tar\.gz|tgz|tar\.xz|txz|tar\.bz2|tbz2?|tar)$", low):
+        with tarfile.open(path) as t:
+            for mbr in t.getmembers():
+                if mbr.name.startswith("/") or ".." in mbr.name.split("/"):
+                    raise Fail("в архиве подозрительный путь: %s" % mbr.name)
+            t.extractall(dest)
+    elif low.endswith(".zip"):
+        with zipfile.ZipFile(path) as z:
+            for zi in z.infolist():
+                if zi.filename.startswith("/") or ".." in zi.filename.split("/"):
+                    raise Fail("в архиве подозрительный путь: %s" % zi.filename)
+                out = z.extract(zi, dest)
+                mode = (zi.external_attr >> 16) & 0o777
+                if mode:
+                    os.chmod(out, mode)
+    elif low.endswith(".appimage"):
+        return None  # распаковывается в chroot (рантайм AppImage может требовать новую glibc)
+    else:
+        os.makedirs(os.path.join(dest, "bin"), exist_ok=True)
+        shutil.copy(path, os.path.join(dest, "bin", name))
+        os.chmod(os.path.join(dest, "bin", name), 0o755)
+        return dest
+    items = [i for i in os.listdir(dest) if not i.startswith(".")]
+    if len(items) == 1 and os.path.isdir(os.path.join(dest, items[0])):
+        return os.path.join(dest, items[0])
+    return dest
+
+
+def desktop_execs(tree):
+    out = []
+    d = os.path.join(tree, "share/applications")
+    if os.path.isdir(d):
+        for f in os.listdir(d):
+            if f.endswith(".desktop"):
+                for line in open(os.path.join(d, f), encoding="utf-8", errors="replace"):
+                    if line.startswith("Exec="):
+                        cmd = line[5:].strip().strip('"').split()
+                        if cmd:
+                            out.append(os.path.basename(cmd[0]))
+    return out
+
+
+def plan_links(tree, scan, name):
+    """Что вывести в ~/.local/bin."""
+    bind = os.path.join(tree, "bin")
+    execs = [e for e in desktop_execs(tree) if os.path.isfile(os.path.join(bind, e))]
+    if execs:
+        return ["bin/" + e for e in sorted(set(execs))]
+    if os.path.isdir(bind):
+        return []  # по умолчанию: всё исполняемое из bin/
+    # нет bin/: ELF-программы в корне или на уровень ниже
+    top = [e for e in scan["exes"] if e.count("/") <= 1 and not e.startswith("lib")]
+    pref = [e for e in top if os.path.basename(e).lower() in (name.lower(), name.lower().replace("-", ""))]
+    return pref or top[:3]
+
+
+def detect_options(tree, scan, name, chroot):
+    """Параметры install-binary-from-build-env и файлы из chroot по признакам программы."""
+    opts, extra, notes = [], [], []
+    f = scan["feats"]
+    if "gpu" in f:
+        opts.append("--gpu")
+        notes.append("графика: Mesa/Vulkan из chroot (--gpu)")
+    wk = None
+    if "webkit41" in f:
+        wk = "webkit2gtk-4.1"
+    elif "webkit40" in f:
+        wk = "webkit2gtk-4.0"
+    elif "webkit6" in f:
+        wk = "webkitgtk-6.0"
+    if wk:
+        extra.append("/usr/lib/x86_64-linux-gnu/%s=lib/%s" % (wk, wk))
+        opts += ["--env", "WEBKIT_DISABLE_DMABUF_RENDERER=1"]
+        notes.append("WebKitGTK: процессы WebKit копируются внутрь программы")
+    if wk or "gtk" in f:
+        opts += ["--env", "GIO_MODULE_DIR=@CHROOT@/usr/lib/x86_64-linux-gnu/gio/modules",
+                 "--env", "GDK_PIXBUF_MODULE_FILE=@CHROOT@/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache",
+                 "--env", "GTK_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/gtk-3.0",
+                 "--env", "GSETTINGS_SCHEMA_DIR=@CHROOT@/usr/share/glib-2.0/schemas",
+                 "--env", "XDG_DATA_DIRS=@APP@/share:@CHROOT@/usr/share:/usr/local/share:/usr/share"]
+        notes.append("GTK: модули, иконки и схемы из chroot")
+    for q in ("5", "6"):
+        if "qt" + q in f:
+            opts += ["--env", "QT_PLUGIN_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/qt%s/plugins" % q,
+                     "--env", "QML2_IMPORT_PATH=@CHROOT@/usr/lib/x86_64-linux-gnu/qt%s/qml" % q]
+            notes.append("Qt%s: плагины из chroot" % q)
+    if "electron" in f:
+        opts += ["--arg", "--no-sandbox"]
+        notes.append("Electron: запуск с --no-sandbox (песочница Chromium требует setuid)")
+    return opts, extra, notes
+
+
+# --- Установка ----------------------------------------------------------------------------
+class Job:
+    def __init__(self, name, kind):
+        check_name(name)
+        self.name, self.kind = name, kind
+        self.work = os.path.join(CACHE, "work", "%s-%d" % (name, int(time.time())))
+        os.makedirs(self.work)
+        self.log = os.path.join(self.work, "log.txt")
+        self.chroot = chroot_path()
+        if not os.path.isdir(self.chroot + "/usr"):
+            raise Fail("chroot не найден: %s" % self.chroot)
+
+    def cleanup(self, keep=False):
+        if keep:
+            info("файлы и журнал оставлены: %s" % self.work)
+        else:
+            shutil.rmtree(self.work, ignore_errors=True)
+
+
+def resolve_missing(job, tree, scan, depends=()):
+    """Ставит в chroot пакеты для недостающих библиотек (и зависимости .deb). -> оставшиеся."""
+    miss = missing_libs(scan, job.chroot)
+    if not miss and not depends:
+        return []
+    if miss:
+        say("Недостающие библиотеки: %s" % ", ".join(miss))
+        info("ищу пакеты Debian (первый раз apt-file скачивает индекс, это пара минут)")
+    if depends:
+        say("Зависимости пакета: %s" % ", ".join(" | ".join(g) for g in depends))
+    found = apt_install_for([(so, so_regex(so), "") for so in miss], job.work, job.log, groups=depends)
+    for so, p in sorted(found.items()):
+        ok("%s ← %s" % (so, p) if not so.startswith("dep:") else p)
+    left = missing_libs(scan, job.chroot)
+    for so in left:
+        warn("не нашёл пакет с %s — программа может не запуститься" % so)
+    return left
+
+
+WEBKIT = {"webkit41": ("webkit2gtk-4.1", "libwebkit2gtk-4.1.so.0"),
+          "webkit40": ("webkit2gtk-4.0", "libwebkit2gtk-4.0.so.37"),
+          "webkit6": ("webkitgtk-6.0", "libwebkitgtk-6.0.so.4")}
+
+
+def webkit_link(name):
+    return os.path.join(HOME, ".abe", hashlib.md5(name.encode()).hexdigest()[:6])
+
+
+def webkit_patch(job, scan):
+    """Путь к процессам WebKit зашит в библиотеку (/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1),
+    а WEBKIT_EXEC_PATH обычные сборки игнорируют. Кладём в программу копию библиотеки, где этот
+    путь заменён на короткую ссылку ~/.abe/ID той же длины (лишнее добивается слэшами), а ссылка
+    ведёт на пропатченные процессы внутри программы. -> (параметры установки, (ссылка, цель))"""
+    for feat, (wk, lib) in WEBKIT.items():
+        if feat not in scan["feats"]:
+            continue
+        orig = "/usr/lib/x86_64-linux-gnu/" + wk
+        link = webkit_link(job.name)
+        if len(link) > len(orig):
+            warn("путь %s длиннее %s — процессы WebKit не найдутся" % (link, orig))
+            return [], None
+        src = os.path.realpath(job.chroot + "/usr/lib/x86_64-linux-gnu/" + lib)
+        if not src.startswith(job.chroot) or not os.path.isfile(src):
+            src = job.chroot + "/usr/lib/x86_64-linux-gnu/" + lib
+        if not os.path.isfile(src):
+            warn("в chroot нет %s" % lib)
+            return [], None
+        data = open(src, "rb").read()
+        n = data.count(orig.encode())
+        if not n:
+            warn("в %s не нашёл путь к процессам WebKit" % lib)
+            return [], None
+        data = data.replace(orig.encode(), link.encode().ljust(len(orig), b"/"))
+        out = os.path.join(job.work, "wk", lib)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(data)
+        info("WebKit: путь к процессам в %s заменён на %s" % (lib, link))
+        return ["--lib", out], (link, os.path.join(app_dir(job.name), "lib", wk))
+    return [], None
+
+
+def strip_lib_opts(opts):
+    out, skip = [], False
+    for o in opts:
+        if skip:
+            skip = False
+            continue
+        if o in ("--lib", "-l"):
+            skip = True
+            continue
+        out.append(o)
+    return out
+
+
+def prev_snapshot(name):
+    d, p = app_dir(name), os.path.join(OPT, "." + name + ".prev")
+    if os.path.isdir(d):
+        shutil.rmtree(p, ignore_errors=True)
+        if subprocess.call(["cp", "-al", d, p], stderr=subprocess.DEVNULL) != 0:
+            subprocess.call(["cp", "-a", d, p])
+
+
+def install_tree(job, tree, opts, extra, links, meta, tree_in_chroot=None, pre="", temp_opts=()):
+    """Установка дерева через install-binary-from-build-env (в chroot). tree — путь на хосте."""
+    script = os.path.join(job.work, ".install.sh")
+    q = shlex.quote
+    t = tree_in_chroot or tree
+    lines = ["set -e", pre]
+    for e in extra:
+        src, rel = e.split("=", 1)
+        lines.append("if [ -e %s ]; then mkdir -p %s; rm -rf %s; cp -a %s %s; echo %s; else echo %s >&2; fi" % (
+            q(src), q(os.path.dirname(t + "/" + rel)), q(t + "/" + rel), q(src), q(t + "/" + rel),
+            q("  + %s из chroot" % src), q("  ! в chroot нет %s" % src)))
+    args = ["install-binary-from-build-env", "--force"] + list(opts) + list(temp_opts)
+    if not any(o == "--link" for o in opts):
+        for l in links:
+            args += ["--link", l]
+    args += ["--name", job.name, "--tree", t]
+    lines.append(" ".join(q(a) for a in args))
+    with open(script, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    prev_snapshot(job.name)
+    run_env(["bash", script], cwd=job.work, log=job.log)
+    if not os.path.isdir(app_dir(job.name)):
+        raise Fail("установка не создала %s" % app_dir(job.name))
+    meta["OPTS"] = strip_lib_opts(opts)
+    if not any(o == "--link" for o in opts):
+        for l in links:
+            meta["OPTS"] += ["--link", l]
+    meta["EXTRA"] = extra
+    save_meta(job.name, meta)
+
+
+def appimage_desktop(tree, name):
+    """Ярлык и иконка AppImage лежат в корне — переносим туда, где их ищет install-binary-from-build-env."""
+    for f in os.listdir(tree):
+        p = os.path.join(tree, f)
+        if f.endswith(".desktop") and os.path.isfile(p):
+            os.makedirs(os.path.join(tree, "share/applications"), exist_ok=True)
+            lines = []
+            for line in open(p, encoding="utf-8", errors="replace"):
+                if line.startswith("Exec="):
+                    rest = line[5:].strip().split(None, 1)
+                    line = "Exec=%s%s\n" % (name, (" " + rest[1]) if len(rest) > 1 else "")
+                elif line.startswith("TryExec="):
+                    continue
+                lines.append(line)
+            with open(os.path.join(tree, "share/applications", f), "w") as o:
+                o.writelines(lines)
+        elif re.search(r"\.(png|svg|xpm)$", f) and os.path.isfile(os.path.realpath(p)):
+            os.makedirs(os.path.join(tree, "share/pixmaps"), exist_ok=True)
+            shutil.copy(os.path.realpath(p), os.path.join(tree, "share/pixmaps", f))
+
+
+def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, regex="", source=None):
+    job = Job(name, "release")
+    try:
+        say("%s %s: %s" % (repo, rel["tag"], asset_name))
+        f = os.path.join(job.work, "dl", asset_name)
+        os.makedirs(os.path.dirname(f))
+        download(asset_url, f)
+        ok("скачано (%d МБ)" % (os.path.getsize(f) >> 20))
+        depends = deb_depends(f) if f.lower().endswith(".deb") else []
+        tree = extract(f, os.path.join(job.work, "x"), name)
+        if tree is None:  # AppImage: распаковка в chroot
+            ai = os.path.join(job.work, "x")
+            cmd = "cd %s && chmod +x %s && %s --appimage-extract >/dev/null" % (
+                shlex.quote(ai), shlex.quote(f), shlex.quote(f))
+            run_env(["bash", "-c", cmd], cwd=job.work, log=job.log)
+            tree = os.path.join(ai, "squashfs-root")
+            os.makedirs(os.path.join(tree, "bin"), exist_ok=True)
+            link = os.path.join(tree, "bin", name)
+            if not os.path.lexists(link):
+                os.symlink("../AppRun", link)
+            appimage_desktop(tree, name)
+        return finish_tree_install(job, tree, source or "github:" + repo, rel["tag"], regex or "", prev_meta,
+                                   depends=depends)
+    except BaseException:
+        job.cleanup(keep=True)
+        raise
+
+
+def finish_tree_install(job, tree, source, version, asset_regex, prev_meta, extra_notes=(), cleanup=True,
+                        depends=()):
+    scan = scan_tree(tree)
+    if not scan["exes"]:
+        raise Fail("в программе нет ни одного исполняемого ELF-файла")
+    resolve_missing(job, tree, scan, depends)
+    if prev_meta and prev_meta.get("OPTS"):
+        opts, extra, notes = list(prev_meta["OPTS"]), list(prev_meta.get("EXTRA", [])), ["параметры прошлой установки"]
+        links = []
+    else:
+        opts, extra, notes = detect_options(tree, scan, job.name, job.chroot)
+        links = plan_links(tree, scan, job.name)
+    for n in list(extra_notes) + notes:
+        info(n)
+    if extra:  # библиотеки WebKit должны быть в chroot до копирования
+        pk = [(e.split("=", 1)[0], "^" + re.escape(e.split("=", 1)[0]) + "/", "") for e in extra
+              if not os.path.exists(job.chroot + e.split("=", 1)[0])]
+        if pk:
+            apt_install_for(pk, job.work, job.log, update=False)
+    wk_opts, wk_link = webkit_patch(job, scan)
+    say("Установка %s %s" % (job.name, version))
+    meta = {"SOURCE": source, "ASSET": asset_regex, "VERSION": version}
+    install_tree(job, tree, strip_lib_opts(opts), extra, links, meta, temp_opts=wk_opts)
+    if wk_link:
+        os.makedirs(os.path.dirname(wk_link[0]), exist_ok=True)
+        if os.path.lexists(wk_link[0]):
+            os.remove(wk_link[0])
+        os.symlink(wk_link[1], wk_link[0])
+    ok("%s %s установлен" % (job.name, version))
+    if cleanup:
+        job.cleanup()
+    return job.name
+
+
+def default_name(repo):
+    n = re.sub(r"[^\w.+-]", "-", repo.split("/")[1].lower())
+    return re.sub(r"[-_](releases?|binaries|bin|linux|desktop|app)$", "", n) or n
+
+
+def install_github(repo, name=None, asset=None, source_build=False, force_name=False):
+    existing = find_by_source("github:" + repo) or find_by_source("github-src:" + repo)
+    name = name or existing or default_name(repo)
+    if os.path.isdir(app_dir(name)) and name != existing and not force_name:
+        other = load_meta(name)["SOURCE"]
+        if other:
+            raise Fail("%s уже установлен из %s — задайте другое имя (--name) или --force" % (name, other))
+        info("%s уже установлен без источника обновлений — заменю и буду обновлять из GitHub" % name)
+    say("GitHub: %s" % repo)
+    rel = None if source_build else latest_release(repo)
+    if rel:
+        cand = pick_assets(rel["assets"], asset)
+        if cand:
+            _, an, au = cand[0]
+            if len(cand) > 1:
+                info("выбран файл %s (другие: %s)" % (an, ", ".join(c[1] for c in cand[1:4])))
+            return install_release(repo, rel, an, au, name, regex=asset or "")
+        info("в релизе %s нет сборки под Linux x86_64 — соберу из исходников" % rel["tag"])
+    elif not source_build:
+        info("релизов нет — соберу из исходников")
+    return install_source(repo, name, rel["tag"] if rel else None)
+
+
+# --- Сборка из исходников ---------------------------------------------------------------------
+DEP_PATTERNS = [
+    (r"fatal error: ([\w./+-]+\.h): No such file", "hdr"),
+    (r"([\w./+-]+\.h): No such file or directory", "hdr"),
+    (r"Package '([\w.+-]+)',? (?:required by .*)?not found", "pc"),
+    (r"No package '([\w.+-]+)' found", "pc"),
+    (r"Package ([\w.+-]+) was not found in the pkg-config search path", "pc"),
+    (r"Dependency \"?([\w.+-]+)\"? (?:found: NO|not found)", "pc"),
+    (r"Run-time dependency ([\w.+-]+) found: NO", "pc"),
+    (r"None of the required '([\w.+-]+)' found", "pc"),
+    (r"Could NOT find ([\w]+)", "cmake"),
+    (r"Could not find a package configuration file provided by \"([\w]+)\"", "cmake"),
+    (r"cannot find -l([\w.+-]+)", "lib"),
+    (r"(?:^|\s)([\w.+-]+): (?:command )?not found", "bin"),
+    (r"Program '([\w.+-]+)' not found", "bin"),
+    (r"Can't exec \"([\w.+-]+)\"", "bin"),
+    (r"(aclocal|autoreconf|automake|autoconf|libtoolize|pkg-config|cargo|rustc|go|meson|ninja|cmake)"
+     r"[^\n]{0,40}(?:not found|No such file)", "bin"),
+]
+
+
+ERR_LINE = re.compile(r"(?:configure: error: |CMake Error[^:]*: |ERROR: |error: )(.+)$", re.M)
+STOP = set("""cannot can't could not find found required library libraries package packages program the for
+please install installed development headers header files version or and missing unable to of is are was in
+with without support enable disable option a an be your system check see config log make error failed fatal
+make sure set path variable no such file directory none any need needs needed requires minimum newer than
+using use build building""".split())
+
+
+def dep_groups_from_errors(text, tried):
+    """Запасной путь: слова из строки ошибки configure/cmake/meson -> пакеты lib<слово>-dev."""
+    groups = []
+    for m in list(ERR_LINE.finditer(text))[-3:]:
+        m2 = re.search(r"Package requirements \(([^)]+)\) were not met", m.group(1))
+        words = re.findall(r"[A-Za-z][\w+-]{2,}", m2.group(1) if m2 else m.group(1))
+        for w in words:
+            w = w.lower().rstrip("-")
+            if w in STOP or w.isdigit() or "word:" + w in tried:
+                continue
+            tried.add("word:" + w)
+            w = re.sub(r"^lib", "", w)
+            groups.append(["lib%s-dev" % w, "%s-dev" % w, "lib%sw-dev" % w])
+    return groups
+
+
+def dep_patterns_from_log(text, tried):
+    pats = []
+    m = re.search(r"Package requirements \(([^)]+)\) were not met", text)
+    if m:
+        for v in re.findall(r"([A-Za-z][\w.+-]*)", m.group(1)):
+            if "pc:" + v not in tried:
+                tried.add("pc:" + v)
+                pats.append(("pc:" + v, r"^/usr/(lib/x86_64-linux-gnu|lib|share)/pkgconfig/" + re.escape(v) + r"\.pc$", ""))
+    for rx, kind in DEP_PATTERNS:
+        for m in re.finditer(rx, text, re.M):
+            v = m.group(1)
+            key = kind + ":" + v
+            if key in tried or v in ("sh", "bash", "make", "it", "file", "error"):
+                continue
+            tried.add(key)
+            e = re.escape(v)
+            if kind == "hdr":
+                pats.append((key, r"^/usr/include/(.*/)?" + e + "$", ""))
+            elif kind == "pc":
+                pats.append((key, r"^/usr/(lib/x86_64-linux-gnu|lib|share)/pkgconfig/" + e + r"\.pc$", ""))
+            elif kind == "cmake":
+                pats.append((key, r"/(%sConfig|%s-config|Find%s)\.cmake$" % (e, e, e), "-i"))
+            elif kind == "lib":
+                pats.append((key, r"^/usr/lib/(x86_64-linux-gnu/)?lib" + e + r"\.(so|a)$", ""))
+            elif kind == "bin":
+                pats.append((key, r"^/(usr/)?s?bin/" + e + "$", ""))
+    return pats
+
+
+BUILD_SH = r'''
+set -e
+cd "$SRC"
+PREFIX="$BUILD_ENV_OPT/$NAME"
+STAGE="$WORK/stage"
+J=$(nproc 2>/dev/null || echo 2)
+step() { echo "@@step $*"; }
+need() { command -v "$1" >/dev/null || { echo "$1: command not found"; exit 127; }; }
+case "$SYSTEM" in
+  cargo)
+    need cargo; step cargo build --release
+    cargo build --release --locked 2>&1 || cargo build --release
+    mkdir -p "$STAGE$PREFIX/bin"
+    find target/release -maxdepth 1 -type f -perm -u+x ! -name '*.so' ! -name '*.d' -exec cp {} "$STAGE$PREFIX/bin/" \;
+    ;;
+  go)
+    need go; step go build
+    mkdir -p "$STAGE$PREFIX/bin"
+    if [ -d cmd ] && ! ls ./*.go >/dev/null 2>&1; then go build -trimpath -o "$STAGE$PREFIX/bin/" ./cmd/...
+    else go build -trimpath -o "$STAGE$PREFIX/bin/" .; fi
+    ;;
+  meson)
+    need meson; step meson
+    [ -d _abe ] || meson setup _abe --prefix="$PREFIX" --buildtype=release
+    ninja -C _abe -j "$J"
+    DESTDIR="$STAGE" meson install -C _abe
+    ;;
+  cmake)
+    need cmake; step cmake
+    cmake -S . -B _abe -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX"
+    cmake --build _abe -j "$J"
+    DESTDIR="$STAGE" cmake --install _abe
+    ;;
+  autotools)
+    if [ ! -x configure ]; then
+      step autogen
+      if [ -x autogen.sh ]; then NOCONFIGURE=1 ./autogen.sh; else need autoreconf; autoreconf -fi; fi
+    fi
+    step configure; ./configure --prefix="$PREFIX"
+    step make; make -j "$J"
+    make install DESTDIR="$STAGE"
+    ;;
+  make)
+    step make; make -j "$J" PREFIX="$PREFIX" prefix="$PREFIX"
+    make install PREFIX="$PREFIX" prefix="$PREFIX" DESTDIR="$STAGE"
+    ;;
+esac
+echo "@@built"
+'''
+
+
+def detect_build_system(src):
+    has = lambda f: os.path.exists(os.path.join(src, f))
+    if has("Cargo.toml"):
+        return "cargo"
+    if has("go.mod"):
+        return "go"
+    if has("meson.build"):
+        return "meson"
+    if has("CMakeLists.txt"):
+        return "cmake"
+    if has("configure") or has("configure.ac") or has("autogen.sh"):
+        return "autotools"
+    if has("Makefile") or has("makefile"):
+        return "make"
+    return None
+
+
+TOOLCHAIN = {"cargo": [("cargo", "cargo")], "go": [("go", "golang-go")],
+             "meson": [("meson", "meson"), ("ninja", "ninja-build")], "cmake": [("cmake", "cmake")],
+             "autotools": [("autoreconf", "autoconf"), ("automake", "automake"), ("libtoolize", "libtool"),
+                           ("autopoint", "autopoint"), ("msgfmt", "gettext"), ("pkg-config", "pkg-config")],
+             "make": [("pkg-config", "pkg-config")]}
+
+
+def install_source(repo, name, tag=None, prev_meta=None):
+    job = Job(name, "source")
+    try:
+        src = os.path.join(job.work, "src")
+        ref = ["--branch", tag] if tag else []
+        say("Исходники %s%s" % (repo, " " + tag if tag else ""))
+        clone = ("git clone --depth 1 %s %s %s && git -C %s rev-parse --short HEAD > %s" % (
+            " ".join(shlex.quote(r) for r in ref), shlex.quote("%s/%s.git" % (GH_WEB, repo)), shlex.quote(src),
+            shlex.quote(src), shlex.quote(os.path.join(job.work, ".commit"))))
+        run_env(["bash", "-c", clone], cwd=job.work, log=job.log)
+        commit = open(os.path.join(job.work, ".commit")).read().strip()
+        version = tag or commit
+        system = detect_build_system(src)
+        if not system:
+            if os.path.exists(os.path.join(src, "pyproject.toml")) or os.path.exists(os.path.join(src, "setup.py")):
+                raise Fail("это программа на Python — ставьте её через pipx или uv, а не сборкой")
+            if os.path.exists(os.path.join(src, "package.json")):
+                raise Fail("это программа на Node.js — сборку npm astra-get не делает")
+            raise Fail("не понял, как собирать (нет Cargo.toml, go.mod, meson.build, CMakeLists.txt, configure, Makefile)")
+        info("система сборки: %s" % system)
+        tools = [pk for b, pk in TOOLCHAIN[system] if not os.path.exists(job.chroot + "/usr/bin/" + b)]
+        if tools:
+            say("Инструменты сборки в chroot: %s" % " ".join(tools))
+            run_env(["bash", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; "
+                     "apt-get install -y -q --no-install-recommends " + " ".join(tools)],
+                    root=True, cwd=job.work, log=job.log)
+        script = os.path.join(job.work, ".build.sh")
+        with open(script, "w") as f:
+            f.write(BUILD_SH)
+        tried = set()
+        for attempt in range(1, 9):
+            say("Сборка (попытка %d)" % attempt)
+            blog = os.path.join(job.work, "build-%d.log" % attempt)
+            rc = run_env(["env", "SRC=" + src, "WORK=" + job.work, "NAME=" + name, "SYSTEM=" + system,
+                          "bash", script], cwd=job.work, log=blog, check=False)
+            if rc == 0:
+                break
+            text = open(blog, encoding="utf-8", errors="replace").read()
+            pats = dep_patterns_from_log(text, tried)
+            groups = [] if pats else dep_groups_from_errors(text, tried)
+            if not pats and not groups:
+                tail = "\n".join(text.strip().splitlines()[-8:])
+                raise Fail("сборка не удалась, а недостающих зависимостей в журнале не видно.\n%s\nЖурнал: %s"
+                           % (tail, blog))
+            if pats:
+                say("Не хватает: %s" % ", ".join(p[0].split(":", 1)[1] for p in pats))
+            else:
+                say("Пробую пакеты по тексту ошибки: %s" % ", ".join(g[0] for g in groups))
+            found = apt_install_for(pats, job.work, job.log, update=(attempt == 1), groups=groups)
+            if not found:
+                raise Fail("не нашёл пакеты для того, чего не хватает (журнал: %s)" % blog)
+            for k, p in found.items():
+                ok("%s ← %s" % (k.split(":", 1)[1], p))
+            if system == "meson":
+                shutil.rmtree(os.path.join(src, "_abe"), ignore_errors=True)
+        else:
+            raise Fail("сборка так и не прошла за 8 попыток")
+        tree = os.path.join(job.work, "stage", OPT.lstrip("/"), name)
+        if not os.path.isdir(tree):
+            raise Fail("после сборки не нашёл установленных файлов в %s" % tree)
+        return finish_tree_install(job, tree, "github-src:" + repo, version, "", prev_meta)
+    except BaseException:
+        job.cleanup(keep=True)
+        raise
+
+
+# --- Пакеты Debian -----------------------------------------------------------------------------
+HOST_LINK_SKIP = {"doc", "man", "info", "locale", "applications", "icons", "pixmaps", "metainfo", "appdata",
+                  "bash-completion", "zsh", "fish", "lintian", "menu", "mime", "glib-2.0", "dbus-1", "polkit-1",
+                  "help", "gnome", "themes", "fonts", "sounds", "X11", "xml", "sgml", "common-licenses", "perl5",
+                  "pkgconfig", "aclocal", "gtk-doc", "vala", "gir-1.0", "thumbnailers", "systemd"}
+
+
+def chroot_dpkg_version(chroot, pkg):
+    st = chroot + "/var/lib/dpkg/status"
+    if not os.path.exists(st):
+        return ""
+    cur, ver, inst = None, "", False
+    for line in open(st, encoding="utf-8", errors="replace"):
+        if line.startswith("Package: "):
+            cur, ver, inst = line[9:].strip(), "", False
+        elif line.startswith("Status: ") and cur == pkg:
+            inst = "installed" in line and "not-installed" not in line
+        elif line.startswith("Version: ") and cur == pkg:
+            ver = line[9:].strip()
+        elif line.strip() == "" and cur == pkg and inst:
+            return ver
+    return ver if inst else ""
+
+
+def deb_newer(a, b):
+    """a новее b по правилам dpkg."""
+    if not b:
+        return True
+    try:
+        return subprocess.call(["dpkg", "--compare-versions", a, "gt", b]) == 0
+    except OSError:
+        return a > b
+
+
+def chroot_candidate(chroot, pkg):
+    """Самая новая версия пакета в списках apt chroot (без sudo, по уже скачанным спискам)."""
+    best = ""
+    lists = chroot + "/var/lib/apt/lists"
+    if not os.path.isdir(lists):
+        return ""
+    for fn in os.listdir(lists):
+        if not fn.endswith("_Packages"):
+            continue
+        cur = None
+        for line in open(os.path.join(lists, fn), encoding="utf-8", errors="replace"):
+            if line.startswith("Package: "):
+                cur = line[9:].strip()
+            elif cur == pkg and line.startswith("Version: "):
+                v = line[9:].strip()
+                if deb_newer(v, best):
+                    best = v
+                cur = None
+    return best
+
+
+def install_debian(pkg, name=None, prev_meta=None, host_links=True):
+    name = name or find_by_source("debian:" + pkg) or pkg
+    job = Job(name, "debian")
+    try:
+        say("Пакет Debian %s" % pkg)
+        q = shlex.quote
+        script = os.path.join(job.work, ".deb.sh")
+        with open(script, "w") as f:
+            f.write("set -e\nexport DEBIAN_FRONTEND=noninteractive\napt-get update -qq\n"
+                    "apt-get install -y -q %s\ndpkg-query -W -f='${Version}' %s > .version\n"
+                    "dpkg -L %s > .files\n" % (q(pkg), q(pkg), q(pkg)))
+        run_env(["bash", script], root=True, cwd=job.work, log=job.log)
+        version = open(os.path.join(job.work, ".version")).read().strip()
+        files = [l.strip() for l in open(os.path.join(job.work, ".files")) if l.strip()]
+        tree = os.path.join(job.work, "tree")
+        os.makedirs(os.path.join(tree, "bin"))
+        n_bin = 0
+        for p in files:
+            full = job.chroot + p
+            if not os.path.isfile(full) or os.path.islink(full):
+                continue
+            if re.match(r"^/(usr/)?(s?bin|games)/[^/]+$", p) and os.access(full, os.X_OK):
+                shutil.copy2(full, os.path.join(tree, "bin", os.path.basename(p)))
+                n_bin += 1
+            m = re.match(r"^/usr/share/(applications|icons|pixmaps|metainfo)/(.+)$", p)
+            if m:
+                dst = os.path.join(tree, "share", m.group(1), m.group(2))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(full, dst)
+        if not n_bin:
+            raise Fail("в пакете %s нет программ в /usr/bin — это библиотека или данные?" % pkg)
+        links = []
+        if host_links:
+            for p in files:
+                m = re.match(r"^(/usr/share|/usr/lib/x86_64-linux-gnu|/usr/lib)/([^/]+)$", p)
+                if not m or m.group(2) in HOST_LINK_SKIP or not os.path.isdir(job.chroot + p) or os.path.islink(job.chroot + p):
+                    continue
+                if not os.path.lexists(p):
+                    links.append(p)
+        meta_extra_notes = ["данные программы остаются в chroot"]
+        if links:
+            say("Каталоги данных, которые программа ищет по жёсткому пути — ссылки на хосте (sudo)")
+            for p in links:
+                info("%s → %s%s" % (p, job.chroot, p))
+            made = []
+            for p in links:
+                if host_sudo(["ln", "-s", job.chroot + p, p]) == 0:
+                    made.append(p)
+            if made:
+                with open(os.path.join(job.work, ".host-links"), "w") as f:
+                    f.write("\n".join(made) + "\n")
+        name = finish_tree_install(job, tree, "debian:" + pkg, version, "", prev_meta, meta_extra_notes, cleanup=False)
+        hl = os.path.join(job.work, ".host-links")
+        if os.path.exists(hl):
+            old = os.path.join(app_dir(name), ".host-links")
+            prev = set(open(old).read().split()) if os.path.exists(old) else set()
+            with open(old, "w") as f:
+                f.write("\n".join(sorted(prev | set(open(hl).read().split()))) + "\n")
+        job.cleanup()
+        return name
+    except BaseException:
+        job.cleanup(keep=True)
+        raise
+
+
+def debian_search(q, limit=30):
+    chroot = chroot_path()
+    lists = chroot + "/var/lib/apt/lists"
+    res, rx = [], re.compile(re.escape(q), re.I)
+    if not os.path.isdir(lists):
+        return res
+    for fn in sorted(os.listdir(lists)):
+        if not fn.endswith("_Packages"):
+            continue
+        pkg, desc, sec = None, "", ""
+        for line in open(os.path.join(lists, fn), encoding="utf-8", errors="replace"):
+            if line.startswith("Package: "):
+                pkg, desc, sec = line[9:].strip(), "", ""
+            elif line.startswith("Section: "):
+                sec = line[9:].strip()
+            elif line.startswith("Description: "):
+                desc = line[13:].strip()
+                if pkg and (rx.search(pkg) or rx.search(desc)) and not re.search(r"(-dev|-doc|-dbg|-data|-common|^lib)", pkg) \
+                        and not sec.startswith(("libs", "libdevel", "oldlibs", "doc", "debug")):
+                    res.append({"kind": "debian", "spec": "deb:" + pkg, "name": pkg, "description": desc})
+                    if len(res) >= limit * 4:
+                        break
+    res.sort(key=lambda r: (r["name"] != q, not r["name"].startswith(q), len(r["name"])))
+    seen, out = set(), []
+    for r in res:
+        if r["name"] not in seen:
+            seen.add(r["name"])
+            out.append(r)
+    return out[:limit]
+
+
+def github_search(q, limit=10):
+    try:
+        j = gh_json("/search/repositories?" + urllib.parse.urlencode({"q": q, "per_page": limit}))
+    except (urllib.error.URLError, ValueError):
+        return []
+    return [{"kind": "github", "spec": r["full_name"], "name": r["full_name"],
+             "description": (r.get("description") or "")[:200], "stars": r.get("stargazers_count", 0)}
+            for r in j.get("items", [])]
+
+
+# --- Команды -----------------------------------------------------------------------------------
+def cmd_install(a):
+    kind, val = parse_spec(a.spec)
+    if a.name:
+        check_name(a.name)
+    if kind == "name":
+        if chroot_candidate(chroot_path(), val) or chroot_dpkg_version(chroot_path(), val):
+            kind = "debian"
+        else:
+            hits = debian_search(val, 5)
+            msg = "«%s» — не ссылка на GitHub и не пакет Debian." % val
+            if hits:
+                msg += " Похожие пакеты: " + ", ".join(h["name"] for h in hits)
+            raise Fail(msg + "  Поиск: astra-get search %s" % val)
+    if kind == "github":
+        return install_github(val, a.name, a.asset, a.source, a.force)
+    if kind == "debian":
+        return install_debian(val, a.name, host_links=not a.no_host_links)
+    if kind == "url":
+        fn = urllib.parse.unquote(val.rsplit("/", 1)[-1].split("?")[0])
+        name = a.name or re.sub(r"[-_.]?(v?\d[\w.]*)?([-_.](linux|amd64|x86_64|x64).*)?\.(deb|tar\..*|tgz|zip|appimage)$",
+                                "", fn, flags=re.I).lower() or "app"
+        check_name(name)
+        rel = {"tag": fn, "assets": [(fn, val)]}
+        return install_release(val, rel, fn, val, name, source="url:" + val)
+
+
+def check_updates(names=None, quiet=False):
+    """-> список dict(name, source, installed, latest, update)."""
+    out = []
+    chroot = chroot_path()
+    for n in names or installed():
+        m = load_meta(n)
+        r = {"name": n, "source": m["SOURCE"], "installed": m["VERSION"], "latest": "", "update": False, "error": ""}
+        src = m["SOURCE"]
+        try:
+            if src.startswith("github:"):
+                rel = latest_release(src[7:])
+                if rel:
+                    r["latest"] = rel["tag"]
+            elif src.startswith("github-src:"):
+                repo = src[11:]
+                rel = latest_release(repo)
+                if rel:
+                    r["latest"] = rel["tag"]
+                else:
+                    j = gh_json("/repos/%s/commits?per_page=1" % repo)
+                    r["latest"] = j[0]["sha"][:7] if j else ""
+            elif src.startswith("debian:"):
+                r["latest"] = chroot_candidate(chroot, src[7:]) or chroot_dpkg_version(chroot, src[7:])
+        except (Fail, urllib.error.URLError, ValueError, KeyError, IndexError) as e:
+            r["error"] = str(e)
+        r["update"] = bool(r["latest"]) and r["latest"] != r["installed"]
+        out.append(r)
+    return out
+
+
+def update_one(n, force=False):
+    m = load_meta(n)
+    src = m["SOURCE"]
+    if not src:
+        p = PRESETS.get(n)
+        if not p:
+            raise Fail("%s: неизвестно, откуда обновлять (astra-get track %s ИСТОЧНИК)" % (n, n))
+        m["SOURCE"], m["ASSET"] = p
+        src = p[0]
+    if not m["OPTS"]:
+        m["OPTS"] = install_opts_of(n)
+    if src.startswith("github:"):
+        repo = src[7:]
+        rel = latest_release(repo)
+        if not rel:
+            raise Fail("%s: у %s больше нет релизов" % (n, repo))
+        if rel["tag"] == m["VERSION"] and not force:
+            ok("%s: уже последняя версия %s" % (n, rel["tag"]))
+            return
+        cand = pick_assets(rel["assets"], m["ASSET"] or None)
+        if not cand:
+            raise Fail("%s: в релизе %s нет подходящего файла" % (n, rel["tag"]))
+        install_release(repo, rel, cand[0][1], cand[0][2], n, prev_meta=m, regex=m["ASSET"])
+    elif src.startswith("github-src:"):
+        repo = src[11:]
+        rel = latest_release(repo)
+        install_source(repo, n, rel["tag"] if rel else None, prev_meta=m)
+    elif src.startswith("debian:"):
+        install_debian(src[7:], n, prev_meta=m)
+    else:
+        raise Fail("%s: источник %s обновлять не умею" % (n, src))
+
+
+def install_opts_of(n):
+    f = os.path.join(app_dir(n), ".install-opts")
+    if not os.path.isfile(f):
+        return []
+    out = subprocess.check_output(["bash", "-c", 'OPTS=(); . "$1"; printf "%s\\0" "${OPTS[@]}"', "x", f])
+    return [o for o in out.decode("utf-8", "replace").split("\0") if o]
+
+
+def cmd_update(a):
+    names = a.names
+    if a.check or not names and not a.all:
+        res = check_updates(names or None)
+        if JSON_MODE:
+            print(json.dumps(res, ensure_ascii=False))
+            return
+        say("Программы build-env")
+        for r in res:
+            if not r["source"]:
+                hint = "  (известная: astra-get track %s)" % r["name"] if r["name"] in PRESETS else ""
+                print("  %-16s %s%s" % (r["name"], _c("2", "источник не задан"), hint))
+            elif r["error"]:
+                print("  %-16s %s" % (r["name"], _c("33", "ошибка проверки: " + r["error"][:80])))
+            elif r["update"]:
+                print("  %-16s %s" % (r["name"], _c("1;33", "%s → %s" % (r["installed"] or "?", r["latest"]))))
+            else:
+                print("  %-16s %s" % (r["name"], _c("32", (r["installed"] or "?") + "  актуальная")))
+        if any(r["update"] for r in res):
+            print("\nПоставить: astra-get update --all  (или astra-get update ИМЯ)")
+        return
+    if a.all:
+        names = [r["name"] for r in check_updates() if r["update"]]
+        if not names:
+            ok("обновлений нет")
+            return
+    failed = []
+    for n in names:
+        try:
+            update_one(n, force=bool(a.names))
+        except Fail as e:
+            warn(str(e))
+            failed.append(n)
+    if failed:
+        raise Fail("не обновились: " + ", ".join(failed))
+
+
+def cmd_remove(a):
+    for n in a.names:
+        check_name(n)
+        d = app_dir(n)
+        if not os.path.isdir(d):
+            raise Fail("%s не установлен" % n)
+        hl = os.path.join(d, ".host-links")
+        links = open(hl).read().split() if os.path.exists(hl) else []
+        subprocess.check_call([tool("install-binary-from-build-env"), "--remove", n])
+        for p in links:
+            if os.path.islink(p) and os.readlink(p).startswith(chroot_path()):
+                host_sudo(["rm", "-f", p])
+                info("удалена ссылка %s" % p)
+        shutil.rmtree(os.path.join(OPT, "." + n + ".prev"), ignore_errors=True)
+        wl = webkit_link(n)
+        if os.path.islink(wl) and os.readlink(wl).startswith(d + "/"):
+            os.remove(wl)
+        ok("%s удалён" % n)
+
+
+def cmd_rollback(a):
+    n = a.name
+    check_name(n)
+    d, p = app_dir(n), os.path.join(OPT, "." + n + ".prev")
+    if not os.path.isdir(p):
+        raise Fail("для %s нет сохранённой прошлой версии" % n)
+    tmp = d + ".rb.%d" % os.getpid()
+    os.rename(d, tmp)
+    os.rename(p, d)
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok("%s: возвращена версия %s" % (n, load_meta(n)["VERSION"] or "?"))
+
+
+def app_list():
+    res = []
+    for n in installed():
+        m = load_meta(n)
+        d = app_dir(n)
+        links = []
+        lf = os.path.join(d, ".links")
+        if os.path.exists(lf):
+            links = [l.strip() for l in open(lf) if l.strip()]
+        cmds = [l for l in links if l.startswith(BIN + "/")]
+        desk = [l for l in links if l.endswith(".desktop")]
+        res.append({"name": n, "version": m["VERSION"], "source": m["SOURCE"], "commands": cmds, "desktop": desk,
+                    "rollback": os.path.isdir(os.path.join(OPT, "." + n + ".prev"))})
+    return res
+
+
+def cmd_list(a):
+    res = app_list()
+    if JSON_MODE:
+        print(json.dumps(res, ensure_ascii=False))
+        return
+    if not res:
+        print("Ничего не установлено. Пример: astra-get install https://github.com/sharkdp/bat")
+    for r in res:
+        print("%-16s %-14s %s" % (r["name"], r["version"] or "?", r["source"] or _c("2", "(источник не задан)")))
+        for c in r["commands"]:
+            print("    → " + c)
+
+
+def cmd_search(a):
+    res = debian_search(a.query, a.limit) + ([] if a.no_github else github_search(a.query, a.limit))
+    if JSON_MODE:
+        print(json.dumps(res, ensure_ascii=False))
+        return
+    for r in res:
+        star = " ★%d" % r["stars"] if r.get("stars") else ""
+        print("%-38s %s" % (r["spec"] + star, r["description"][:90]))
+    if not res:
+        print("Ничего не нашлось.")
+
+
+def cmd_resolve(a):
+    """Что будет установлено (для GUI и проверки перед установкой)."""
+    kind, val = parse_spec(a.spec)
+    r = {"spec": a.spec, "kind": kind, "target": val}
+    if kind == "name":
+        ch = chroot_path()
+        if chroot_candidate(ch, val) or chroot_dpkg_version(ch, val):
+            kind = r["kind"] = "debian"
+    if kind == "github":
+        rel = latest_release(val)
+        r["name"] = find_by_source("github:" + val) or find_by_source("github-src:" + val) or default_name(val)
+        if rel:
+            cand = pick_assets(rel["assets"], a.asset)
+            r["version"] = rel["tag"]
+            r["assets"] = [{"name": c[1], "url": c[2], "score": c[0]} for c in cand]
+            r["all_assets"] = [n for n, _ in rel["assets"]]
+            r["method"] = "release" if cand else "source"
+        else:
+            r["method"], r["version"], r["assets"] = "source", "", []
+    elif kind == "debian":
+        ch = chroot_path()
+        r["name"] = find_by_source("debian:" + val) or val
+        r["version"] = chroot_candidate(ch, val) or chroot_dpkg_version(ch, val)
+        r["method"] = "debian"
+    elif kind == "url":
+        r["method"], r["name"] = "url", re.sub(r"\W.*$", "", val.rsplit("/", 1)[-1]).lower()
+    else:
+        r["method"] = "unknown"
+        r["suggest"] = debian_search(val, 8)
+    r["installed"] = bool(r.get("name")) and os.path.isdir(app_dir(r["name"]))
+    if JSON_MODE:
+        print(json.dumps(r, ensure_ascii=False))
+    else:
+        for k, v in r.items():
+            if k not in ("all_assets",):
+                print("%-10s %s" % (k, v if not isinstance(v, list) else ", ".join(x.get("name", str(x)) if isinstance(x, dict) else str(x) for x in v[:6])))
+
+
+def cmd_track(a):
+    n = a.name
+    check_name(n)
+    if not os.path.isdir(app_dir(n)):
+        raise Fail("%s не установлен" % n)
+    m = load_meta(n)
+    if a.source:
+        k, v = parse_spec(a.source)
+        if k == "github":
+            m["SOURCE"] = ("github-src:" if a.from_source else "github:") + v
+        elif k == "debian":
+            m["SOURCE"] = "debian:" + v
+        else:
+            raise Fail("источник: github:владелец/репо, ссылка на GitHub или deb:пакет")
+    elif n in PRESETS:
+        m["SOURCE"], m["ASSET"] = PRESETS[n]
+    elif not m["SOURCE"]:
+        raise Fail("укажите источник: astra-get track %s https://github.com/владелец/репо" % n)
+    if a.asset:
+        m["ASSET"] = a.asset
+    if a.version:
+        m["VERSION"] = a.version
+    if not m["OPTS"]:
+        m["OPTS"] = install_opts_of(n)
+    save_meta(n, m)
+    ok("%s: источник %s, версия %s" % (n, m["SOURCE"], m["VERSION"] or "неизвестна"))
+
+
+def cmd_run(a):
+    for r in app_list():
+        if r["name"] == a.name and r["commands"]:
+            os.execv(r["commands"][0], [r["commands"][0]] + a.args)
+    raise Fail("у %s нет команды для запуска" % a.name)
+
+
+def main():
+    global JSON_MODE, PROGRESS_LINES
+    ap = argparse.ArgumentParser(
+        prog="astra-get", description="Пакетный менеджер для Astra Linux поверх astra-chroot-build-env",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""примеры:
+  astra-get install https://github.com/sharkdp/bat     готовый релиз (.deb, архив, AppImage)
+  astra-get install htop-dev/htop                      нет сборки под Linux -> из исходников
+  astra-get install deb:krita                          пакет Debian trixie
+  astra-get search markdown                            поиск в Debian и на GitHub
+  astra-get update                                     есть ли обновления
+  astra-get update --all                               поставить все обновления
+  astra-get-gui                                        окно""")
+    ap.add_argument("--json", action="store_true", help="вывод в JSON (для GUI и скриптов)")
+    ap.add_argument("--progress-lines", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("-V", "--version", action="version", version="astra-get " + VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("install", help="установить по ссылке, owner/repo или deb:пакет")
+    p.add_argument("spec")
+    p.add_argument("--name", help="имя программы (по умолчанию из репозитория)")
+    p.add_argument("--asset", help="регулярное выражение файла релиза")
+    p.add_argument("--source", action="store_true", help="собрать из исходников, даже если есть релиз")
+    p.add_argument("--no-host-links", action="store_true", help="для deb: не создавать ссылки на каталоги данных")
+    p.add_argument("--force", action="store_true", help="заменить программу с тем же именем из другого источника")
+    p = sub.add_parser("remove", help="удалить")
+    p.add_argument("names", nargs="+")
+    p = sub.add_parser("list", help="что установлено")
+    p = sub.add_parser("update", help="проверить или поставить обновления")
+    p.add_argument("names", nargs="*")
+    p.add_argument("--all", action="store_true", help="поставить все доступные обновления")
+    p.add_argument("--check", action="store_true", help="только проверить")
+    p = sub.add_parser("rollback", help="вернуть версию до последнего обновления")
+    p.add_argument("name")
+    p = sub.add_parser("search", help="поиск программ в Debian trixie и на GitHub")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=15)
+    p.add_argument("--no-github", action="store_true")
+    p = sub.add_parser("resolve", help="показать, что и как будет установлено")
+    p.add_argument("spec")
+    p.add_argument("--asset")
+    p = sub.add_parser("track", help="задать источник обновлений для уже установленной программы")
+    p.add_argument("name")
+    p.add_argument("source", nargs="?")
+    p.add_argument("--asset")
+    p.add_argument("--version")
+    p.add_argument("--from-source", action="store_true")
+    p = sub.add_parser("run", help="запустить установленную программу")
+    p.add_argument("name")
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+    JSON_MODE, PROGRESS_LINES = a.json, a.progress_lines
+    if not a.cmd:
+        ap.print_help()
+        return 0
+    if os.geteuid() == 0:
+        raise Fail("запускайте от обычного пользователя, sudo astra-get спросит сам")
+    os.makedirs(CACHE, exist_ok=True)
+    fn = {"install": cmd_install, "remove": cmd_remove, "list": cmd_list, "update": cmd_update,
+          "rollback": cmd_rollback, "search": cmd_search, "resolve": cmd_resolve, "track": cmd_track,
+          "run": cmd_run}[a.cmd]
+    fn(a)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Fail as e:
+        if JSON_MODE:
+            print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        print(_c("31", "Ошибка: ") + str(e), file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.HTTPError as e:
+        print(_c("31", "Ошибка: ") + "сервер ответил %s на %s" % (e.code, e.geturl()), file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(_c("31", "Ошибка сети: ") + str(e.reason), file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(_c("31", "Ошибка: ") + "команда завершилась с кодом %d: %s" % (e.returncode, " ".join(map(str, e.cmd))), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
