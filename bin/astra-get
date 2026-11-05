@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -563,23 +563,97 @@ def find_by_source(source):
 
 
 # --- Подготовка дерева программы -------------------------------------------------------------
+def has_real_elf(d):
+    if not os.path.isdir(d):
+        return False
+    for f in os.listdir(d):
+        p = os.path.join(d, f)
+        if not os.path.islink(p) and os.path.isfile(p) and elf_info(p) is not None:
+            return True
+    return False
+
+
+def deb_root(dest):
+    """Корень программы внутри распакованного .deb.
+    Chrome, VS Code, Obsidian и др. живут в /opt/..., а в /usr/bin только ссылки на них."""
+    usr = os.path.join(dest, "usr")
+    app = None
+    optd = os.path.join(dest, "opt")
+    if os.path.isdir(optd) and not has_real_elf(os.path.join(usr, "bin")):
+        for dp, dn, fn in sorted(os.walk(optd), key=lambda t: t[0].count("/")):
+            if dp.count("/") - optd.count("/") > 3:
+                break
+            if any(elf_info(os.path.join(dp, f)) and os.access(os.path.join(dp, f), os.X_OK)
+                   for f in fn if not os.path.islink(os.path.join(dp, f))):
+                app = dp
+                break
+    if not app:
+        if os.path.isdir(os.path.join(usr, "bin")) or os.path.isdir(os.path.join(usr, "lib")):
+            return usr
+        return dest
+    for sub in ("applications", "icons", "pixmaps", "metainfo"):  # ярлык и иконки лежат вне /opt
+        src = os.path.join(usr, "share", sub)
+        if os.path.isdir(src) and not os.path.exists(os.path.join(app, "share", sub)):
+            shutil.copytree(src, os.path.join(app, "share", sub), symlinks=True)
+    bind = os.path.join(usr, "bin")
+    for f in sorted(os.listdir(bind)) if os.path.isdir(bind) else []:
+        p = os.path.join(bind, f)
+        if os.path.islink(p):  # /usr/bin/google-chrome-stable -> /opt/google/chrome/google-chrome
+            t = os.readlink(p)
+            t = dest + t if t.startswith("/") else os.path.normpath(os.path.join(bind, t))
+            if os.path.exists(t) and os.path.realpath(t).startswith(os.path.realpath(app) + "/"):
+                os.makedirs(os.path.join(app, "bin"), exist_ok=True)
+                link = os.path.join(app, "bin", f)
+                if not os.path.lexists(link):
+                    os.symlink(os.path.relpath(os.path.realpath(t), os.path.join(app, "bin")), link)
+    return app
+
+
+def deb_field(path, field):
+    try:
+        return subprocess.check_output(["dpkg-deb", "-f", path, field]).decode("utf-8", "replace").strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def fix_icons(tree):
+    """Иконка из ярлыка, которой нет в share/icons|pixmaps (Chrome ставит её скриптом), — из png программы."""
+    appd = os.path.join(tree, "share/applications")
+    if not os.path.isdir(appd):
+        return
+    pngs = []
+    for dp, dn, fn in os.walk(tree):
+        if dp.count("/") - tree.count("/") > 1:
+            continue
+        pngs += [os.path.join(dp, f) for f in fn if f.endswith(".png") and ("logo" in f or "icon" in f)]
+    for f in os.listdir(appd):
+        if not f.endswith(".desktop"):
+            continue
+        icon = None
+        for line in open(os.path.join(appd, f), encoding="utf-8", errors="replace"):
+            if line.startswith("Icon="):
+                icon = line[5:].strip()
+                break
+        if not icon or "/" in icon:
+            continue
+        found = False
+        for sub in ("share/icons", "share/pixmaps"):
+            for dp, dn, fn in os.walk(os.path.join(tree, sub)):
+                if any(os.path.splitext(x)[0] == icon for x in fn):
+                    found = True
+        if not found and pngs:
+            best = max(pngs, key=os.path.getsize)
+            os.makedirs(os.path.join(tree, "share/pixmaps"), exist_ok=True)
+            shutil.copy(best, os.path.join(tree, "share/pixmaps", icon + ".png"))
+
+
 def extract(path, dest, name):
     """Распаковывает файл релиза в dest; -> корень дерева программы."""
     os.makedirs(dest, exist_ok=True)
     low = path.lower()
     if low.endswith(".deb"):
         subprocess.check_call(["dpkg-deb", "-x", path, dest])
-        if os.path.isdir(os.path.join(dest, "usr/bin")) or os.path.isdir(os.path.join(dest, "usr/lib")):
-            return os.path.join(dest, "usr")
-        opt = os.path.join(dest, "opt")
-        if os.path.isdir(opt) and len(os.listdir(opt)) == 1:
-            root = os.path.join(opt, os.listdir(opt)[0])
-            for sub in ("applications", "icons", "pixmaps"):  # ярлык и иконки лежат вне /opt
-                s = os.path.join(dest, "usr/share", sub)
-                if os.path.isdir(s) and not os.path.exists(os.path.join(root, "share", sub)):
-                    shutil.copytree(s, os.path.join(root, "share", sub), symlinks=True)
-            return root
-        return dest
+        return deb_root(dest)
     if re.search(r"\.(tar\.gz|tgz|tar\.xz|txz|tar\.bz2|tbz2?|tar)$", low):
         with tarfile.open(path) as t:
             for mbr in t.getmembers():
@@ -870,14 +944,17 @@ def root_desktop(tree, name, appimage=False):
                 shutil.copy(os.path.realpath(os.path.join(tree, pick[0])), os.path.join(tree, "share/pixmaps", icon + ext))
 
 
-def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, regex="", source=None):
+def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, regex="", source=None, local=None):
     job = Job(name, "release")
     try:
-        say("%s %s: %s" % (repo, rel["tag"], asset_name))
         f = os.path.join(job.work, "dl", asset_name)
         os.makedirs(os.path.dirname(f))
-        download(asset_url, f)
-        ok("скачано (%d МБ)" % (os.path.getsize(f) >> 20))
+        if local:
+            shutil.move(local, f)
+        else:
+            say("%s %s: %s" % (repo, rel["tag"], asset_name))
+            download(asset_url, f)
+            ok("скачано (%d МБ)" % (os.path.getsize(f) >> 20))
         depends = deb_depends(f) if f.lower().endswith(".deb") else []
         tree = extract(f, os.path.join(job.work, "x"), name)
         if tree is None:  # AppImage: распаковка в chroot
@@ -907,6 +984,7 @@ def finish_tree_install(job, tree, source, version, asset_regex, prev_meta, extr
                 os.remove(os.path.join(tree, shim))
     if not os.path.isdir(os.path.join(tree, "share/applications")):
         root_desktop(tree, job.name)
+    fix_icons(tree)
     scan = scan_tree(tree)
     if not scan["exes"]:
         raise Fail("в программе нет ни одного исполняемого ELF-файла")
@@ -1371,12 +1449,43 @@ def cmd_install(a):
     if kind == "debian":
         return install_debian(val, a.name, host_links=not a.no_host_links)
     if kind == "url":
-        fn = urllib.parse.unquote(val.rsplit("/", 1)[-1].split("?")[0])
-        name = a.name or re.sub(r"[-_.]?(v?\d[\w.]*)?([-_.](linux|amd64|x86_64|x64).*)?\.(deb|tar\..*|tgz|zip|appimage)$",
-                                "", fn, flags=re.I).lower() or "app"
-        check_name(name)
-        rel = {"tag": fn, "assets": [(fn, val)]}
-        return install_release(val, rel, fn, val, name, source="url:" + val)
+        return install_url(val, a.name)
+
+
+def fetch_url(url):
+    """Скачивает файл по ссылке -> (путь, имя файла, версия). Версия: из .deb или sha256 файла."""
+    fn = urllib.parse.unquote(url.rsplit("/", 1)[-1].split("?")[0]) or "download"
+    d = os.path.join(CACHE, "dl")
+    os.makedirs(d, exist_ok=True)
+    f = os.path.join(d, fn)
+    say("Скачиваю %s" % url)
+    download(url, f)
+    ok("скачано (%d МБ)" % (os.path.getsize(f) >> 20))
+    ver = deb_field(f, "Version") if fn.lower().endswith(".deb") else ""
+    if not ver:
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        ver = "sha256:" + h.hexdigest()[:12]
+    return f, fn, ver
+
+
+def install_url(url, name=None, prev_meta=None, force=True):
+    f, fn, ver = fetch_url(url)
+    if not name:
+        name = (deb_field(f, "Package") if fn.lower().endswith(".deb") else "") or \
+            re.sub(r"[-_.]?(v?\d[\w.]*)?([-_.](linux|amd64|x86_64|x64).*)?\.(deb|tar\..*|tgz|zip|appimage)$",
+                   "", fn, flags=re.I).lower() or "app"
+        name = find_by_source("url:" + url) or name
+    check_name(name)
+    if prev_meta and prev_meta.get("VERSION") == ver and not force:
+        ok("%s: уже последняя версия %s" % (name, ver))
+        os.remove(f)
+        return name
+    rel = {"tag": ver, "assets": [(fn, url)]}
+    say("%s %s" % (name, ver))
+    return install_release(url, rel, fn, url, name, prev_meta=prev_meta, source="url:" + url, local=f)
 
 
 def check_updates(names=None, quiet=False):
@@ -1438,6 +1547,8 @@ def update_one(n, force=False):
         install_source(repo, n, rel["tag"] if rel else None, prev_meta=m)
     elif src.startswith("debian:"):
         install_debian(src[7:], n, prev_meta=m)
+    elif src.startswith("url:"):
+        install_url(src[4:], n, prev_meta=m, force=force)
     else:
         raise Fail("%s: источник %s обновлять не умею" % (n, src))
 
@@ -1459,7 +1570,9 @@ def cmd_update(a):
             return
         say("Программы build-env")
         for r in res:
-            if not r["source"]:
+            if r["source"].startswith("url:"):
+                print("  %-16s %s" % (r["name"], (r["installed"] or "?") + _c("2", "  (по ссылке: astra-get update %s скачает и сравнит)" % r["name"])))
+            elif not r["source"]:
                 hint = "  (известная: astra-get track %s)" % r["name"] if r["name"] in PRESETS else ""
                 print("  %-16s %s%s" % (r["name"], _c("2", "источник не задан"), hint))
             elif r["error"]:
