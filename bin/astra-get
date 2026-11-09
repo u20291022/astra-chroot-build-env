@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.1.4"
+VERSION = "2.2.0"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -135,35 +135,99 @@ def tool(name):
     return p
 
 
-def run_env(args, root=False, cwd=None, log=None, check=True):
-    """Команда внутри chroot (activate-build-env). Вывод — в консоль и в лог."""
-    cmd = [tool("activate-build-env")] + (["--root"] if root else []) + list(args)
-    env = dict(os.environ)
-    if os.environ.get("SUDO_ASKPASS"):
-        env["BUILD_ENV_SUDO_ASKPASS"] = "1"
-    out = open(log, "ab") if log else None
-    try:
-        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL if os.environ.get("SUDO_ASKPASS") else None,
-                             start_new_session=bool(os.environ.get("SUDO_ASKPASS")))
-        for line in iter(p.stdout.readline, b""):
+class Session:
+    """Один вход в build-env (один пароль sudo) на всю работу astra-get: activate-build-env
+    --session выполняет команды, которые мы присылаем построчно."""
+
+    def __init__(self):
+        self.p = None
+
+    def start(self):
+        if self.p and self.p.poll() is None:
+            return
+        os.makedirs(CACHE, exist_ok=True)
+        env = dict(os.environ)
+        say("Вход в build-env (sudo)")
+        if os.environ.get("SUDO_ASKPASS"):
+            info("пароль спросит отдельное окно; при входе по отпечатку сначала приложите палец")
+        self.p = subprocess.Popen([tool("activate-build-env"), "--session"], cwd=CACHE, env=env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in iter(self.p.stdout.readline, b""):
+            t = line.decode("utf-8", "replace").rstrip("\n")
+            if t == "@@abe-session-ready":
+                return
+            if not JSON_MODE and t.strip():
+                print("      " + t, flush=True)
+        self.p.wait()
+        self.p = None
+        raise Fail("не удалось войти в build-env (неверный пароль или activate-build-env старше 1.2: "
+                   "обновите скрипты через install.sh)")
+
+    def run(self, mode, cwd, cmdline, log=None):
+        if "\n" in cmdline or "\t" in cmdline or "\t" in cwd:
+            raise Fail("недопустимые символы в команде")
+        self.start()
+        self.p.stdin.write(("%s\t%s\t%s\n" % (mode, cwd, cmdline)).encode("utf-8"))
+        self.p.stdin.flush()
+        out = open(log, "ab") if log else None
+        rc, pending = None, None
+        try:
+            for line in iter(self.p.stdout.readline, b""):
+                m = re.match(rb"^@@abe-rc (\d+)$", line.rstrip(b"\n"))
+                if m:
+                    rc = int(m.group(1))
+                    break
+                if pending is not None:  # перед маркером сеанс печатает пустую строку — её не показываем
+                    self._emit(pending, out)
+                pending = line
+            if pending is not None and pending.strip():
+                self._emit(pending, out)
+        finally:
             if out:
-                out.write(line)
-            if not JSON_MODE:
-                sys.stdout.write("      " + line.decode("utf-8", "replace"))
-                sys.stdout.flush()
-        rc = p.wait()
-    finally:
+                out.close()
+        if rc is None:
+            self.p = None
+            raise Fail("сеанс build-env неожиданно завершился")
+        return rc
+
+    @staticmethod
+    def _emit(line, out):
         if out:
-            out.close()
+            out.write(line)
+        if not JSON_MODE:
+            sys.stdout.write("      " + line.decode("utf-8", "replace"))
+            sys.stdout.flush()
+
+    def close(self):
+        if self.p and self.p.poll() is None:
+            try:
+                self.p.stdin.close()
+                self.p.wait(timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                self.p.kill()
+        self.p = None
+
+
+SESSION = Session()
+
+
+def run_env(args, root=False, cwd=None, log=None, check=True):
+    """Команда внутри chroot (через общий сеанс build-env). Вывод — в консоль и в лог."""
+    cwd = os.path.abspath(cwd or CACHE)
+    if not (cwd + "/").startswith(os.path.abspath(CACHE) + "/"):
+        raise Fail("рабочая папка вне %s: %s" % (CACHE, cwd))
+    rc = SESSION.run("root" if root else "user", cwd, " ".join(shlex.quote(a) for a in args), log)
     if check and rc != 0:
         raise Fail("команда в build-env завершилась с ошибкой (%d): %s" % (rc, " ".join(args[:3])))
     return rc
 
 
-def host_sudo(args):
-    sudo = ["sudo", "-A"] if os.environ.get("SUDO_ASKPASS") else ["sudo"]
-    return subprocess.call(sudo + list(args))
+def host_link(src, dst):
+    return SESSION.run("hostln", src, dst) == 0
+
+
+def host_unlink(path):
+    return SESSION.run("hostrm", "/", path) == 0
 
 
 # --- Сеть ----------------------------------------------------------------------------------
@@ -500,16 +564,16 @@ def deb_depends(path):
     return out
 
 
-def apt_install_for(patterns, workdir, log, update=True, groups=()):
+def apt_install_for(patterns, workdir, log, update=True, groups=(), pre=()):
     """patterns: [(описание, регвыр, флаги)] -> ставит найденные пакеты в chroot. -> {описание: пакет}
     groups: [[пакет | альтернатива ...]] — поставить первый доступный в trixie из каждой группы."""
-    if not patterns and not groups:
+    if not patterns and not groups and not pre:
         return {}
     res = os.path.join(workdir, ".apt-found")
     lines = [APT_SEARCH_FUNCS, "set -e", "cd %s" % shlex.quote(workdir)]
     if update:
         lines.append("apt-get update -qq || true")
-    lines += ["ensure_apt_file", ": > .apt-found", "pk=()"]
+    lines += ["ensure_apt_file", ": > .apt-found", "pk=()"] + list(pre)
     for desc, rx, flags in patterns:
         lines.append('p=$(find_pkg %s %s); if [ -n "$p" ]; then printf "%%s\\t%%s\\n" %s "$p" >> .apt-found; pk+=("$p"); fi'
                      % (shlex.quote(rx), flags, shlex.quote(desc)))
@@ -1221,6 +1285,80 @@ def detect_build_system(src):
     return None
 
 
+MAX_BUILD_ATTEMPTS = 25  # каждая попытка, кроме последней, должна что-то доставить
+
+DEB_SRC_SH = r'''
+if ! grep -rqsE '^[[:space:]]*deb-src[[:space:]]|^Types:.*deb-src' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+  grep -hsE '^[[:space:]]*deb[[:space:]].*debian\.org' /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
+    | sed -E 's/^[[:space:]]*deb([[:space:]])/deb-src\1/' > /etc/apt/sources.list.d/astra-get-src.list
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] && grep -q 'debian\.org' "$f" && sed -i -E 's/^Types:[[:space:]]*deb[[:space:]]*$/Types: deb deb-src/' "$f"
+  done
+  apt-get update -qq || true
+fi
+'''
+
+
+def scan_build_deps(src, system):
+    """Зависимости, объявленные в файлах сборки: собираем заранее, чтобы поставить одним разом."""
+    pc, cm = set(), set()
+
+    def read(rel):
+        p = os.path.join(src, rel)
+        return open(p, encoding="utf-8", errors="replace").read() if os.path.isfile(p) else ""
+    files = []
+    for dp, dn, fn in os.walk(src):
+        dn[:] = [d for d in dn if not d.startswith(".") and d not in ("subprojects", "third_party", "vendor", "test",
+                                                                      "tests", "_abe")]
+        if dp.count("/") - src.count("/") > 3:
+            dn[:] = []
+        for f in fn:
+            if f in ("meson.build", "CMakeLists.txt", "configure.ac", "configure.in"):
+                files.append(os.path.relpath(os.path.join(dp, f), src))
+    for rel in files[:60]:
+        t = read(rel)
+        for m in re.finditer(r"dependency\(\s*'([\w.+-]+)'([^)]*)\)", t):
+            if not re.search(r"required\s*:\s*false", m.group(2)) and m.group(1) not in ("threads", "dl", "m", "rt"):
+                pc.add(m.group(1))
+        for m in re.finditer(r"pkg_(?:check|search)_modules\s*\(\s*\w+\s+((?:[^)]|\n)*)\)", t):
+            if "REQUIRED" in m.group(1):
+                for w in re.findall(r"([A-Za-z][\w.+-]*)", m.group(1)):
+                    if w not in ("REQUIRED", "IMPORTED_TARGET", "QUIET", "GLOBAL", "NO_CMAKE_PATH"):
+                        pc.add(w)
+        for m in re.finditer(r"find_package\s*\(\s*(\w+)([^)]*)\)", t):
+            if "REQUIRED" in m.group(2) and m.group(1) not in ("PkgConfig", "Threads"):
+                cm.add(m.group(1))
+        for m in re.finditer(r"PKG_CHECK_MODULES\(\s*\[?\w+\]?\s*,\s*\[?([^\],)]+)", t):
+            for w in re.findall(r"([A-Za-z][\w.+-]*)", m.group(1)):
+                pc.add(w)
+    pats = [("pc:" + v, r"^/usr/(lib/x86_64-linux-gnu|lib|share)/pkgconfig/" + re.escape(v) + r"\.pc$", "")
+            for v in sorted(pc)]
+    pats += [("cmake:" + v, r"/(%sConfig|%s-config|Find%s)\.cmake$" % ((re.escape(v),) * 3), "-i") for v in sorted(cm)]
+    return pats
+
+
+def prepare_build(job, src, system, repo):
+    """Всё для сборки одним вызовом apt: инструменты, build-dep пакета Debian с тем же именем
+    (если есть), зависимости из meson.build/CMakeLists.txt/configure.ac."""
+    tools = [[pk] for b, pk in TOOLCHAIN[system] if not os.path.exists(job.chroot + "/usr/bin/" + b)]
+    pats = scan_build_deps(src, system)
+    names = []
+    for n in (repo.split("/")[1].lower(), default_name(repo)):
+        if n not in names and re.match(r"^[a-z0-9][a-z0-9+.-]+$", n):
+            names.append(n)
+    pre = [DEB_SRC_SH,
+           'for n in %s; do if [ -n "$(apt-cache showsrc "$n" 2>/dev/null)" ]; then '
+           'echo "  apt-get build-dep $n (зависимости сборки пакета Debian)"; '
+           'apt-get build-dep -y -qq -o Dpkg::Use-Pty=0 "$n" > .bd.out 2>&1 || tail -n 5 .bd.out; '
+           'printf "%%s\\t%%s\\n" "build-dep:$n" "$n" >> .apt-found; break; fi; done'
+           % " ".join(shlex.quote(n) for n in names)]
+    say("Подготовка сборки: инструменты%s, зависимости из файлов сборки (%d)" % (
+        " " + " ".join(t[0] for t in tools) if tools else "", len(pats)))
+    found = apt_install_for(pats, job.work, job.log, update=True, groups=tools, pre=pre)
+    if found:
+        info("поставлено заранее: %s" % ", ".join(sorted(set(found.values()))))
+
+
 TOOLCHAIN = {"cargo": [("cargo", "cargo")], "go": [("go", "golang-go")],
              "meson": [("meson", "meson"), ("ninja", "ninja-build")], "cmake": [("cmake", "cmake")],
              "autotools": [("autoreconf", "autoconf"), ("automake", "automake"), ("libtoolize", "libtool"),
@@ -1234,7 +1372,8 @@ def install_source(repo, name, tag=None, prev_meta=None):
         src = os.path.join(job.work, "src")
         ref = ["--branch", tag] if tag else []
         say("Исходники %s%s" % (repo, " " + tag if tag else ""))
-        clone = ("git clone --depth 1 %s %s %s && git -C %s rev-parse --short HEAD > %s" % (
+        clone = ("git clone --depth 1 --recurse-submodules --shallow-submodules %s %s %s && "
+                 "git -C %s rev-parse --short HEAD > %s" % (
             " ".join(shlex.quote(r) for r in ref), shlex.quote("%s/%s.git" % (GH_WEB, repo)), shlex.quote(src),
             shlex.quote(src), shlex.quote(os.path.join(job.work, ".commit"))))
         run_env(["bash", "-c", clone], cwd=job.work, log=job.log)
@@ -1248,23 +1387,21 @@ def install_source(repo, name, tag=None, prev_meta=None):
                 raise Fail("это программа на Node.js — сборку npm astra-get не делает")
             raise Fail("не понял, как собирать (нет Cargo.toml, go.mod, meson.build, CMakeLists.txt, configure, Makefile)")
         info("система сборки: %s" % system)
-        tools = [pk for b, pk in TOOLCHAIN[system] if not os.path.exists(job.chroot + "/usr/bin/" + b)]
-        if tools:
-            say("Инструменты сборки в chroot: %s" % " ".join(tools))
-            run_env(["bash", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; "
-                     "apt-get install -y -q --no-install-recommends " + " ".join(tools)],
-                    root=True, cwd=job.work, log=job.log)
+        prepare_build(job, src, system, repo)
         script = os.path.join(job.work, ".build.sh")
         with open(script, "w") as f:
             f.write(BUILD_SH)
-        tried = set()
-        for attempt in range(1, 9):
+        tried, attempt = set(), 0
+        while True:
+            attempt += 1
             say("Сборка (попытка %d)" % attempt)
             blog = os.path.join(job.work, "build-%d.log" % attempt)
             rc = run_env(["env", "SRC=" + src, "WORK=" + job.work, "NAME=" + name, "SYSTEM=" + system,
                           "bash", script], cwd=job.work, log=blog, check=False)
             if rc == 0:
                 break
+            if attempt >= MAX_BUILD_ATTEMPTS:
+                raise Fail("сборка не прошла за %d попыток (журнал: %s)" % (attempt, blog))
             text = open(blog, encoding="utf-8", errors="replace").read()
             pats = dep_patterns_from_log(text, tried)
             groups = [] if pats else dep_groups_from_errors(text, tried)
@@ -1276,15 +1413,13 @@ def install_source(repo, name, tag=None, prev_meta=None):
                 say("Не хватает: %s" % ", ".join(p[0].split(":", 1)[1] for p in pats))
             else:
                 say("Пробую пакеты по тексту ошибки: %s" % ", ".join(g[0] for g in groups))
-            found = apt_install_for(pats, job.work, job.log, update=(attempt == 1), groups=groups)
-            if not found:
+            found = apt_install_for(pats, job.work, job.log, update=False, groups=groups)
+            if not found:  # повторять бессмысленно: поставить нечего
                 raise Fail("не нашёл пакеты для того, чего не хватает (журнал: %s)" % blog)
             for k, p in found.items():
                 ok("%s ← %s" % (k.split(":", 1)[1], p))
             if system == "meson":
                 shutil.rmtree(os.path.join(src, "_abe"), ignore_errors=True)
-        else:
-            raise Fail("сборка так и не прошла за 8 попыток")
         tree = os.path.join(job.work, "stage", OPT.lstrip("/"), name)
         if not os.path.isdir(tree):
             raise Fail("после сборки не нашёл установленных файлов в %s" % tree)
@@ -1298,7 +1433,8 @@ def install_source(repo, name, tag=None, prev_meta=None):
 HOST_LINK_SKIP = {"doc", "man", "info", "locale", "applications", "icons", "pixmaps", "metainfo", "appdata",
                   "bash-completion", "zsh", "fish", "lintian", "menu", "mime", "glib-2.0", "dbus-1", "polkit-1",
                   "help", "gnome", "themes", "fonts", "sounds", "X11", "xml", "sgml", "common-licenses", "perl5",
-                  "pkgconfig", "aclocal", "gtk-doc", "vala", "gir-1.0", "thumbnailers", "systemd"}
+                  "pkgconfig", "aclocal", "gtk-doc", "vala", "gir-1.0", "thumbnailers", "systemd", "emacs",
+                  "vim", "nano", "apport", "bug", "debhelper", "nautilus", "kservices5", "kio"}
 
 
 def chroot_dpkg_version(chroot, pkg):
@@ -1380,6 +1516,7 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
                 dst = os.path.join(tree, "share", m.group(1), m.group(2))
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(full, dst)
+        add_alternatives(job.chroot, tree)
         override = None
         if not n_bin:
             # Серверы и инструменты со своим каталогом: /usr/lib/postgresql/18/bin, /usr/libexec/...
@@ -1408,7 +1545,7 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
                 info("%s → %s%s" % (p, job.chroot, p))
             made = []
             for p in links:
-                if host_sudo(["ln", "-s", job.chroot + p, p]) == 0:
+                if host_link(job.chroot + p, p):
                     made.append(p)
             if made:
                 with open(os.path.join(job.work, ".host-links"), "w") as f:
@@ -1426,6 +1563,37 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
     except BaseException:
         job.cleanup(keep=True)
         raise
+
+
+def chroot_resolve(chroot, path, depth=10):
+    """realpath внутри chroot: абсолютные ссылки считаются от корня chroot."""
+    for _ in range(depth):
+        full = chroot + path
+        if not os.path.islink(full):
+            return path
+        t = os.readlink(full)
+        path = t if t.startswith("/") else os.path.normpath(os.path.join(os.path.dirname(path), t))
+    return path
+
+
+def add_alternatives(chroot, tree):
+    """Команды через update-alternatives (/usr/bin/figlet -> /etc/alternatives/figlet -> figlet-figlet)
+    не входят в список файлов пакета — добавляем их как ссылки на скопированные программы."""
+    bind = os.path.join(tree, "bin")
+    have = set(os.listdir(bind)) if os.path.isdir(bind) else set()
+    for d in ("/usr/bin", "/usr/sbin", "/usr/games"):
+        if not os.path.isdir(chroot + d):
+            continue
+        for f in os.listdir(chroot + d):
+            p = d + "/" + f
+            if f in have or not os.path.islink(chroot + p):
+                continue
+            if "/etc/alternatives/" not in os.readlink(chroot + p) and not os.readlink(chroot + p).startswith("/etc/alternatives"):
+                continue
+            t = chroot_resolve(chroot, p)
+            if os.path.dirname(t) in ("/usr/bin", "/usr/sbin", "/usr/games", "/bin") and os.path.basename(t) in have:
+                os.symlink(os.path.basename(t), os.path.join(bind, f))
+                have.add(f)
 
 
 def copy_usr_tree(chroot, files, tree):
@@ -1675,7 +1843,7 @@ def cmd_remove(a):
         subprocess.check_call([tool("install-binary-from-build-env"), "--remove", n])
         for p in links:
             if os.path.islink(p) and os.readlink(p).startswith(chroot_path()):
-                host_sudo(["rm", "-f", p])
+                host_unlink(p)
                 info("удалена ссылка %s" % p)
         shutil.rmtree(os.path.join(OPT, "." + n + ".prev"), ignore_errors=True)
         wl = webkit_link(n)
@@ -1883,7 +2051,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        try:
+            rc = main()
+        finally:
+            SESSION.close()
+        sys.exit(rc)
     except Fail as e:
         if JSON_MODE:
             print(json.dumps({"error": str(e)}, ensure_ascii=False))

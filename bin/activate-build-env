@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.1.0
+VERSION=1.2.0
 
 usage() {
   cat <<'EOF'
@@ -32,10 +32,12 @@ config_chroot() {  # ДОМАШНИЙ_КАТАЛОГ
 }
 
 ROOT_MODE=${BUILD_ENV_ROOT:-0}
+SESSION=${BUILD_ENV_SESSION:-0}
 case "${1:-}" in
   -h|--help)    usage; exit 0 ;;
   -V|--version) echo "activate-build-env $VERSION"; exit 0 ;;
   --root)       ROOT_MODE=1; shift ;;
+  --session)    SESSION=1; shift ;;   # для astra-get: один sudo на много команд (см. конец файла)
 esac
 
 # --- Обычный пользователь: подготовить данные и перезапуститься через sudo ---
@@ -53,6 +55,7 @@ if [ "$(id -u)" -ne 0 ]; then
   SUDO_A=()
   if [ -n "${SUDO_ASKPASS:-}" ]; then SUDO_A=(-A); fi
   exec sudo "${SUDO_A[@]}" TERM="${TERM:-xterm}" BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_ROOT="$ROOT_MODE" \
+    BUILD_ENV_SESSION="$SESSION" \
     BUILD_ENV_TERMINFO="$TI" "$(readlink -f "$0")" "$@"
 fi
 
@@ -228,6 +231,49 @@ if [ "$ROOT_MODE" = 1 ]; then
   RUN=(chroot "$CHROOT" env -i "${ENVV[@]}")
 else
   RUN=(chroot "$CHROOT" runuser -u "$CH_USER" -- env -i "${ENVV[@]}")
+fi
+
+# Сеанс для astra-get: команды приходят построчно на stdin («режим<TAB>папка<TAB>команда»),
+# после каждой печатается «@@abe-rc КОД». Так пароль sudo спрашивается один раз на всю
+# установку, а не на каждый шаг. Режимы: user и root — внутри chroot; hostln/hostrm — только
+# ссылки на каталоги chroot в /usr/share и /usr/lib хоста (для пакетов Debian).
+if [ "$SESSION" = 1 ]; then
+  ENVR=()
+  for e in "${ENVV[@]}"; do
+    case "$e" in
+      HOME=*) ENVR+=(HOME=/root) ;;
+      USER=*) ENVR+=(USER=root) ;;
+      LOGNAME=*) ENVR+=(LOGNAME=root) ;;
+      *) ENVR+=("$e") ;;
+    esac
+  done
+  RUN_R=(chroot "$CHROOT" env -i "${ENVR[@]}" BUILD_ENV_QUIET=1)
+  RUN_U=(chroot "$CHROOT" runuser -u "$CH_USER" -- env -i "${ENVV[@]}" BUILD_ENV_QUIET=1)
+  # shellcheck disable=SC2016
+  INNER='. /etc/buildenv.bashrc; cd "$1" || exit 1; eval "$2"'
+  echo "@@abe-session-ready"
+  while IFS=$'\t' read -r mode dir cmd; do
+    case "$mode" in
+      root) "${RUN_R[@]}" bash -c "$INNER" build-env "$dir" "$cmd" </dev/null 9>&- 2>&1; rc=$? ;;
+      user) "${RUN_U[@]}" bash -c "$INNER" build-env "$dir" "$cmd" </dev/null 9>&- 2>&1; rc=$? ;;
+      hostln)
+        rc=1
+        if [[ "$cmd" =~ ^/usr/(share|lib|lib/x86_64-linux-gnu)/[^/]+$ ]] && [ "$dir" = "$CHROOT$cmd" ] \
+           && [ -d "$dir" ] && [ ! -e "$cmd" ] && [ ! -L "$cmd" ]; then
+          ln -s "$dir" "$cmd"; rc=$?
+        else
+          echo "отказ: $cmd"
+        fi ;;
+      hostrm)
+        rc=1
+        if [ -L "$cmd" ]; then
+          case "$(readlink "$cmd")/" in "$CHROOT"/*) rm -f "$cmd"; rc=$? ;; *) echo "отказ: $cmd" ;; esac
+        fi ;;
+      *) echo "неизвестный режим: $mode"; rc=2 ;;
+    esac
+    printf '\n@@abe-rc %d\n' "$rc"
+  done
+  exit 0
 fi
 
 set +e
