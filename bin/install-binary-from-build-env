@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.2.1
+VERSION=1.2.3
 
 die()  { echo "install-binary-from-build-env: $*" >&2; exit 1; }
 warn() { echo "  ! $*" >&2; }
@@ -297,10 +297,23 @@ HAS_LIBS=0
 if [ ${#BUNDLE[@]} -gt 0 ] || [ ${#EXTRA_LIBS[@]} -gt 0 ]; then HAS_LIBS=1; fi
 
 # --- Патч --------------------------------------------------------------------
+is_go() { readelf -S "$1" 2>/dev/null | grep -q '\.note\.go\.buildid\|\.gopclntab'; }
+
 patch_file() {  # FILE KIND
   local dest=$1 k=$2 old entry rpath="" interp
   local -a parts=()
   if [ "$STRIP" = 1 ]; then strip --strip-debug "$dest" 2>/dev/null || true; fi
+  # Программы на Go: patchelf --set-rpath их ломает (Segmentation fault). Если загрузчик
+  # уже указывает в chroot (так собирает astra-get), ничего не трогаем; иначе меняем только
+  # загрузчик.
+  if is_go "$dest"; then
+    interp=$(patchelf --print-interpreter "$dest" 2>/dev/null || true)
+    case "$interp" in "$CHROOT"/*|"") return 0 ;; esac
+    patchelf --set-interpreter "$CHROOT$(readlink -f "$interp")" "$dest"
+    echo "  $(basename "$dest"): программа на Go с cgo — RPATH не меняю (patchelf её ломает)." >&2
+    echo "    Если не запустится, соберите с CGO_ENABLED=0 или через astra-get." >&2
+    return 0
+  fi
   old=$(patchelf --print-rpath "$dest" 2>/dev/null || true)
   IFS=: read -ra parts <<< "$old"
   [ "$HAS_LIBS" = 1 ] && rpath=$BUNDLE_DIR
@@ -309,11 +322,13 @@ patch_file() {  # FILE KIND
   done
   rpath+="${SYS_RPATH:+:$SYS_RPATH}"
   rpath=${rpath#:}
+  # Порядок важен: сначала RPATH, потом загрузчик. Наоборот patchelf 0.18 ломает часть больших
+  # программ (официальный Node.js падает с Segmentation fault).
+  patchelf --force-rpath --set-rpath "$rpath" "$dest"
   if [ "$k" = exe ]; then
     interp=$(patchelf --print-interpreter "$dest")
     patchelf --set-interpreter "$CHROOT$(readlink -f "$interp")" "$dest"
   fi
-  patchelf --force-rpath --set-rpath "$rpath" "$dest"
 }
 
 install_file() {  # SRC DEST KIND

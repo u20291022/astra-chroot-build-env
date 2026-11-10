@@ -3,7 +3,7 @@
 # https://github.com/u20291022/astra-chroot-build-env
 set -euo pipefail
 
-VERSION=1.2.0
+VERSION=1.3.0
 
 usage() {
   cat <<'EOF'
@@ -54,7 +54,12 @@ if [ "$(id -u)" -ne 0 ]; then
   # Без терминала (GUI astra-get) пароль спрашивает программа из SUDO_ASKPASS
   SUDO_A=()
   if [ -n "${SUDO_ASKPASS:-}" ]; then SUDO_A=(-A); fi
-  exec sudo "${SUDO_A[@]}" TERM="${TERM:-xterm}" BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_ROOT="$ROOT_MODE" \
+  # Прокси (например, системный прокси Clash) нужен и сборкам в chroot: cargo, go, npm, pip, stack
+  PROXY_ENV=()
+  for v in http_proxy https_proxy no_proxy all_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY; do
+    if [ -n "${!v:-}" ]; then PROXY_ENV+=("$v=${!v}"); fi
+  done
+  exec sudo "${SUDO_A[@]}" "${PROXY_ENV[@]}" TERM="${TERM:-xterm}" BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_ROOT="$ROOT_MODE" \
     BUILD_ENV_SESSION="$SESSION" \
     BUILD_ENV_TERMINFO="$TI" "$(readlink -f "$0")" "$@"
 fi
@@ -227,6 +232,9 @@ ENVV=(
   BUILD_ENV=1 BUILD_ENV_CHROOT="$CHROOT" BUILD_ENV_PROJECT="$PROJECT"
   BUILD_ENV_OPT="$OPT_DIR" BUILD_ENV_BIN="$BIN_DIR" BUILD_ENV_APPS="$APPS_DIR"
 )
+for v in http_proxy https_proxy no_proxy all_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY; do
+  if [ -n "${!v:-}" ]; then ENVV+=("$v=${!v}"); fi
+done
 if [ "$ROOT_MODE" = 1 ]; then
   RUN=(chroot "$CHROOT" env -i "${ENVV[@]}")
 else
@@ -238,6 +246,7 @@ fi
 # установку, а не на каждый шаг. Режимы: user и root — внутри chroot; hostln/hostrm — только
 # ссылки на каталоги chroot в /usr/share и /usr/lib хоста (для пакетов Debian).
 if [ "$SESSION" = 1 ]; then
+  set +e   # ошибка одной команды не должна закрывать сеанс: её код уходит в astra-get
   ENVR=()
   for e in "${ENVV[@]}"; do
     case "$e" in

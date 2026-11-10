@@ -70,7 +70,7 @@ wget -qO- https://raw.githubusercontent.com/u20291022/astra-chroot-build-env/mai
 | Что указать | Что произойдёт |
 |---|---|
 | ссылку на GitHub или `владелец/репозиторий` | берёт последний релиз и выбирает файл под Linux x86_64: `.deb`, архив, AppImage или бинарник |
-| то же, но релиза под Linux нет | клонирует исходники и собирает (cargo, go, meson, cmake, autotools, make) |
+| то же, но релиза под Linux нет | клонирует исходники и собирает (см. ниже, какие системы сборки) |
 | `deb:пакет` или просто имя пакета | ставит пакет Debian trixie в chroot и выводит программу на хост |
 | прямую ссылку на `.deb`/архив/AppImage | скачивает и ставит этот файл |
 
@@ -99,6 +99,26 @@ astra-get remove bat
 astra-get track zed                              # подключить к обновлениям старую установку
 ```
 
+Системы сборки, которые astra-get узнаёт по файлам проекта:
+
+| Язык | Файл | Как собирается | Что ставится при первой встрече |
+|---|---|---|---|
+| Rust | `Cargo.toml` | `cargo build --release` | rustup со свежим Rust (в домашнюю папку chroot) |
+| Go | `go.mod` | `go build` (`GOTOOLCHAIN=auto` — нужная версия Go скачается сама; сначала статически без cgo) | `golang-go` |
+| Zig | `build.zig` | `zig build` (версия из `build.zig.zon`) | официальный Zig нужной версии |
+| Haskell | `stack.yaml` / `*.cabal` | `stack build` / `cabal install` | `haskell-stack` или `ghc` + `cabal-install` |
+| C/C++ | `meson.build`, `CMakeLists.txt`, `configure(.ac)`, `*.pro`, `Makefile` | meson, cmake, autotools, qmake, make | базовые — при установке; для qmake — Qt 6 |
+| Nim | `*.nimble` | `nimble build` | `nim`, `nimble` |
+| D | `dub.json` / `dub.sdl` | `dub build` | `ldc`, `dub` |
+| Python | `pyproject.toml` / `setup.py` | `pip install` в собственный переносимый Python программы | python-build-standalone 3.13 |
+| Node.js | `package.json` с `bin` | `npm install`, `npm run build`, свой `node` внутри программы | `nodejs`, `npm` |
+
+Базовые инструменты (компилятор C/C++, make, cmake, meson, autotools, pkg-config, apt-file)
+ставит `install.sh`; всё остальное — только когда встретится проект на этом языке. Если
+программа выпущена одним бинарником без расширения (как `greenclip`), astra-get возьмёт его
+из релиза и собирать не будет. Прокси из окружения (`https_proxy` и др., например системный
+прокси Clash) передаётся и в сборку внутри chroot.
+
 Что astra-get делает сам, без подсказок:
 
 - **недостающие библиотеки** ищет по индексу пакетов Debian (`apt-file`) и ставит в chroot;
@@ -124,8 +144,7 @@ astra-get track zed                              # подключить к об�
 поставить): список установленного с обновлениями, поиск, установка по ссылке, журнал.
 Пароль sudo спрашивает отдельным окном; при входе по отпечатку сначала приложите палец.
 
-Ограничения: программы на Python и Node.js astra-get не собирает (для них есть `pipx`, `uv`,
-`npm`); GitHub без токена даёт 60 запросов API в час (`export GITHUB_TOKEN=...`), при нехватке
+Ограничения: GitHub без токена даёт 60 запросов API в час (`export GITHUB_TOKEN=...`), при нехватке
 astra-get читает страницы релизов напрямую.
 
 `update-build-env` по-прежнему работает, но `astra-get update` умеет больше источников.

@@ -23,8 +23,11 @@ CONFIG=$CONFIG_DIR/config
 WORK_DIR=$HOME/.cache/astra-build-env
 MARK="# astra-chroot-build-env"
 
+# Базовые инструменты сборки. Остальное (Go, Haskell, Node.js, Qt, Nim, D...) astra-get ставит
+# сам, когда встречает проект на этом языке; Rust и Zig скачиваются при первой сборке.
 PACKAGES="build-essential git curl wget ca-certificates patchelf binutils pkg-config
-cmake meson ninja-build ncurses-term kitty-terminfo xz-utils unzip file"
+cmake meson ninja-build autoconf automake libtool autopoint gettext dpkg-dev apt-file
+python3 ncurses-term kitty-terminfo xz-utils zstd bzip2 unzip file"
 
 if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; N=$'\033[0m'
 else B=""; G=""; Y=""; R=""; N=""; fi

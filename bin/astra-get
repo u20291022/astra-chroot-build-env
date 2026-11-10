@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -401,9 +401,16 @@ def score_asset(name):
     return s
 
 
-def pick_assets(assets, regex=None):
+def pick_assets(assets, regex=None, repo=None):
     """-> отсортированный список (score, name, url), лучший первым."""
     out = []
+    if not regex and repo:
+        # релиз из одного бинарника без расширения с именем программы (greenclip, многие Go/Haskell-утилиты)
+        base = repo.split("/")[-1].lower()
+        for name, url in assets:
+            n = name.lower()
+            if "." not in n and not BAD_TOK.search(n) and (n == base or n.startswith(base + "-")):
+                out.append((0, name, url))
     for name, url in assets:
         if regex:
             if re.search(regex, name):
@@ -427,6 +434,8 @@ def elf_info(path):
             ident = f.read(64)
             if len(ident) < 64 or ident[:4] != b"\x7fELF" or ident[4] != 2 or ident[5] != 1:
                 return None
+            e_type, = struct.unpack_from("<H", ident, 0x10)
+            static_exe = e_type == 2  # ET_EXEC: статическая программа без загрузчика (greenclip и т.п.)
             phoff, = struct.unpack_from("<Q", ident, 0x20)
             phentsize, phnum = struct.unpack_from("<HH", ident, 0x36)
             f.seek(phoff)
@@ -441,7 +450,7 @@ def elf_info(path):
                 elif p_type == 3:
                     interp = True
             if not dyn:
-                return [], interp
+                return [], interp or static_exe
             f.seek(dyn[0])
             d = f.read(dyn[1])
             needed, strtab = [], None
@@ -1131,7 +1140,7 @@ def install_github(repo, name=None, asset=None, source_build=False, force_name=F
     say("GitHub: %s" % repo)
     rel = None if source_build else latest_release(repo)
     if rel:
-        cand = pick_assets(rel["assets"], asset)
+        cand = pick_assets(rel["assets"], asset, repo)
         if cand:
             _, an, au = cand[0]
             if len(cand) > 1:
@@ -1156,6 +1165,10 @@ DEP_PATTERNS = [
     (r"Could NOT find ([\w]+)", "cmake"),
     (r"Could not find a package configuration file provided by \"([\w]+)\"", "cmake"),
     (r"cannot find -l([\w.+-]+)", "lib"),
+    (r"Missing \(or bad\) header file: ([\w./+-]+\.h)", "hdr"),
+    (r"([\w./+-]+\.h)\s*(?:\([^)\n]*\)\s*)?(?:is required|not found|was not found)", "hdr"),
+    (r"The pkg-config package '([\w.+-]+)'", "pc"),
+    (r"pkg-config package ([\w.+-]+)[^\n]{0,40}(?:is required|not found)", "pc"),
     (r"(?:^|\s)([\w.+-]+): (?:command )?not found", "bin"),
     (r"Program '([\w.+-]+)' not found", "bin"),
     (r"Can't exec \"([\w.+-]+)\"", "bin"),
@@ -1172,11 +1185,20 @@ make sure set path variable no such file directory none any need needs needed re
 using use build building""".split())
 
 
+C_SYSTEMS = ("meson", "cmake", "autotools", "make", "qmake")
+NET_ERR = re.compile(r"[^\n]*(?:ReadFailed|Could not resolve host|Temporary failure in name resolution|"
+                     r"Connection (?:refused|reset|timed out)|TLS|SSL|certificate verify|"
+                     r"network is unreachable|failed to (?:fetch|download)|HttpConnectionFailure)[^\n]*", re.I)
+DEP_HINT = re.compile(r"not found|missing|required|could not find|cannot find|no package|not installed", re.I)
+
+
 def dep_groups_from_errors(text, tried):
     """Запасной путь: слова из строки ошибки configure/cmake/meson -> пакеты lib<слово>-dev."""
     groups = []
     for m in list(ERR_LINE.finditer(text))[-3:]:
         m2 = re.search(r"Package requirements \(([^)]+)\) were not met", m.group(1))
+        if not m2 and not DEP_HINT.search(m.group(1)):
+            continue
         words = re.findall(r"[A-Za-z][\w+-]{2,}", m2.group(1) if m2 else m.group(1))
         for w in words:
             w = w.lower().rstrip("-")
@@ -1190,6 +1212,12 @@ def dep_groups_from_errors(text, tried):
 
 def dep_patterns_from_log(text, tried):
     pats = []
+    # cabal/stack: "Missing (or bad) C libraries: X11, Xss"
+    for m in re.finditer(r"Missing \(or bad\) C librar(?:y|ies): ([\w, .+-]+)", text):
+        for v in re.findall(r"[\w.+-]+", m.group(1)):
+            if "lib:" + v not in tried:
+                tried.add("lib:" + v)
+                pats.append(("lib:" + v, r"^/usr/lib/(x86_64-linux-gnu/)?lib" + re.escape(v) + r"\.(so|a)$", ""))
     m = re.search(r"Package requirements \(([^)]+)\) were not met", text)
     if m:
         for v in re.findall(r"([A-Za-z][\w.+-]*)", m.group(1)):
@@ -1222,21 +1250,67 @@ set -e
 cd "$SRC"
 PREFIX="$BUILD_ENV_OPT/$NAME"
 STAGE="$WORK/stage"
+OUT="$STAGE$PREFIX"
 J=$(nproc 2>/dev/null || echo 2)
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.ghcup/bin:$PATH"
 step() { echo "@@step $*"; }
 need() { command -v "$1" >/dev/null || { echo "$1: command not found"; exit 127; }; }
+[ -f "$WORK/.t0" ] || touch "$WORK/.t0"
+# Запасной путь, когда у проекта нет установки: свежесобранные ELF-программы из исходников
+collect_bins() {
+  mkdir -p "$OUT/bin"
+  find "$SRC" -type f -perm -u+x -newer "$WORK/.t0" ! -path '*/.git/*' ! -path '*/_abe/*' ! -name '*.so*' \
+       ! -path '*/.stack-work/install/*/lib/*' -print0 \
+    | while IFS= read -r -d '' f; do
+        if [ "$(head -c4 "$f" | od -An -c | tr -d ' ')" = '177ELF' ]; then cp -f "$f" "$OUT/bin/"; fi
+      done
+  [ -n "$(ls -A "$OUT/bin")" ] || { echo "после сборки не нашлось программ"; exit 1; }
+}
 case "$SYSTEM" in
   cargo)
-    need cargo; step cargo build --release
+    if ! command -v cargo >/dev/null; then
+      step rustup
+      curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+    fi
+    step cargo build --release
     cargo build --release --locked 2>&1 || cargo build --release
-    mkdir -p "$STAGE$PREFIX/bin"
-    find target/release -maxdepth 1 -type f -perm -u+x ! -name '*.so' ! -name '*.d' -exec cp {} "$STAGE$PREFIX/bin/" \;
+    mkdir -p "$OUT/bin"
+    find target/release -maxdepth 1 -type f -perm -u+x ! -name '*.so' ! -name '*.d' -exec cp {} "$OUT/bin/" \;
     ;;
   go)
     need go; step go build
-    mkdir -p "$STAGE$PREFIX/bin"
-    if [ -d cmd ] && ! ls ./*.go >/dev/null 2>&1; then go build -trimpath -o "$STAGE$PREFIX/bin/" ./cmd/...
-    else go build -trimpath -o "$STAGE$PREFIX/bin/" .; fi
+    export GOTOOLCHAIN=auto     # нужна версия Go новее Debian — скачается сама
+    mkdir -p "$OUT/bin"
+    if [ -d cmd ] && ! ls ./*.go >/dev/null 2>&1; then GOPKG=./cmd/...; else GOPKG=.; fi
+    # Сначала без cgo: статический бинарник, патчить не нужно. Go-программы patchelf
+    # с --set-rpath ломает (Segmentation fault), поэтому для cgo загрузчик и пути к
+    # библиотекам chroot прописывает сам компоновщик Go (-I и -r).
+    if ! CGO_ENABLED=0 go build -trimpath -o "$OUT/bin/" $GOPKG 2>&1; then
+      step "go build (cgo)"
+      L="$ABE_CHROOT/usr/lib/x86_64-linux-gnu:$ABE_CHROOT/lib/x86_64-linux-gnu"
+      CGO_ENABLED=1 go build -trimpath \
+        -ldflags "-r $L -I $ABE_CHROOT/lib64/ld-linux-x86-64.so.2" -o "$OUT/bin/" $GOPKG
+    fi
+    ;;
+  zig)
+    ZDIR="$HOME/.cache/astra-get-zig/$ZIG_VERSION"
+    if [ ! -x "$ZDIR/zig" ]; then
+      step "zig $ZIG_VERSION"
+      mkdir -p "$ZDIR"
+      curl -fsSL "$ZIG_URL" | tar -xJ -C "$ZDIR" --strip-components=1
+    fi
+    step zig build
+    "$ZDIR/zig" build -Doptimize=ReleaseSafe --prefix "$OUT"
+    ;;
+  stack)
+    need stack; step stack build
+    stack build --install-ghc --copy-bins --local-bin-path "$OUT/bin"
+    ;;
+  cabal)
+    need cabal; step cabal build
+    cabal update
+    mkdir -p "$OUT/bin"
+    cabal install --installdir="$OUT/bin" --install-method=copy --overwrite-policy=always
     ;;
   meson)
     need meson; step meson
@@ -1248,7 +1322,7 @@ case "$SYSTEM" in
     need cmake; step cmake
     cmake -S . -B _abe -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX"
     cmake --build _abe -j "$J"
-    DESTDIR="$STAGE" cmake --install _abe
+    DESTDIR="$STAGE" cmake --install _abe || collect_bins
     ;;
   autotools)
     if [ ! -x configure ]; then
@@ -1257,30 +1331,106 @@ case "$SYSTEM" in
     fi
     step configure; ./configure --prefix="$PREFIX"
     step make; make -j "$J"
-    make install DESTDIR="$STAGE"
+    make install DESTDIR="$STAGE" || collect_bins
+    ;;
+  qmake)
+    Q=$(command -v qmake6 || command -v qmake || true); [ -n "$Q" ] || { echo "qmake6: command not found"; exit 127; }
+    step qmake; mkdir -p _abe; cd _abe
+    "$Q" PREFIX="$PREFIX" ..
+    make -j "$J"
+    make install INSTALL_ROOT="$STAGE" || collect_bins
+    ;;
+  nim)
+    need nimble; step nimble build
+    nimble build -y -d:release
+    collect_bins
+    ;;
+  dub)
+    need dub; step dub build
+    dub build -b release
+    collect_bins
+    ;;
+  python)
+    step "pip install (свой Python в программе)"
+    mkdir -p "$OUT"
+    cp -a "$PYRT" "$OUT/python"
+    PY="$OUT/python/bin/python3"
+    ls "$OUT/python/bin" > "$WORK/.py-before"
+    "$PY" -m pip install --no-cache-dir --no-warn-script-location "$SRC"
+    mkdir -p "$OUT/bin"
+    for f in "$OUT"/python/bin/*; do
+      b=$(basename "$f")
+      grep -qxF "$b" "$WORK/.py-before" && continue
+      # скрипт запускается своим Python напрямую: путь в его первой строке ведёт в папку сборки
+      printf '#!/bin/sh\nd=$(dirname "$(readlink -f "$0")")\nexec "$d/../python/bin/python3" "$d/../python/bin/%s" "$@"\n' "$b" > "$OUT/bin/$b"
+      chmod +x "$OUT/bin/$b"
+    done
+    [ -n "$(ls -A "$OUT/bin")" ] || { echo "пакет не объявляет команд (console_scripts)"; exit 1; }
+    ;;
+  node)
+    export PATH="$NODERT/bin:$PATH"   # официальный Node.js: Debian-овский держит часть кода в /usr/share/nodejs
+    need npm; step "npm (Node.js $(node --version))"
+    if [ -f package-lock.json ]; then npm ci || npm install; else npm install; fi
+    npm run build --if-present
+    T=$(npm pack --silent | tail -n1)
+    npm install -g --omit=dev --prefix "$OUT" "./$T"
+    cp -L "$NODERT/bin/node" "$OUT/bin/node"
+    for f in "$OUT"/bin/*; do
+      b=$(basename "$f"); [ "$b" = node ] && continue
+      t=$(readlink -f "$f")
+      rel=${t#"$OUT"/}
+      rm -f "$f"
+      printf '#!/bin/sh\nd=$(dirname "$(readlink -f "$0")")\nexec "$d/node" "$d/../%s" "$@"\n' "$rel" > "$f"
+      chmod +x "$f"
+    done
     ;;
   make)
     step make; make -j "$J" PREFIX="$PREFIX" prefix="$PREFIX"
-    make install PREFIX="$PREFIX" prefix="$PREFIX" DESTDIR="$STAGE"
+    make install PREFIX="$PREFIX" prefix="$PREFIX" DESTDIR="$STAGE" || collect_bins
     ;;
 esac
 echo "@@built"
 '''
 
 
+BUILD_SYSTEMS_TEXT = ("Rust (cargo), Go, Zig, Haskell (stack, cabal), C/C++ (meson, cmake, autotools, qmake, make), "
+                      "Nim (nimble), D (dub), Python (pyproject/setup.py), Node.js (package.json)")
+
+
 def detect_build_system(src):
     has = lambda f: os.path.exists(os.path.join(src, f))
+    globs = lambda ext: any(f.endswith(ext) for f in os.listdir(src))
     if has("Cargo.toml"):
         return "cargo"
     if has("go.mod"):
         return "go"
+    if has("build.zig"):
+        return "zig"
+    if has("stack.yaml"):
+        return "stack"
+    if globs(".cabal") or has("cabal.project"):
+        return "cabal"
     if has("meson.build"):
         return "meson"
     if has("CMakeLists.txt"):
         return "cmake"
     if has("configure") or has("configure.ac") or has("autogen.sh"):
         return "autotools"
-    if has("Makefile") or has("makefile"):
+    if globs(".pro"):
+        return "qmake"
+    if globs(".nimble"):
+        return "nim"
+    if has("dub.json") or has("dub.sdl"):
+        return "dub"
+    if has("pyproject.toml") or has("setup.py"):
+        return "python"
+    if has("package.json"):
+        try:
+            if json.load(open(os.path.join(src, "package.json"))).get("bin"):
+                return "node"
+        except (ValueError, OSError):
+            pass
+    if has("Makefile") or has("makefile") or has("GNUmakefile"):
         return "make"
     return None
 
@@ -1337,15 +1487,92 @@ def scan_build_deps(src, system):
     return pats
 
 
+def zig_release(src):
+    """Версия Zig из build.zig.zon (minimum_zig_version) или последняя стабильная -> (версия, ссылка)."""
+    want = None
+    zon = os.path.join(src, "build.zig.zon")
+    if os.path.isfile(zon):
+        m = re.search(r'\.minimum_zig_version\s*=\s*"([\d.]+)"', open(zon, encoding="utf-8", errors="replace").read())
+        if m:
+            want = m.group(1)
+    body, _ = http_get("https://ziglang.org/download/index.json")
+    idx = json.loads(body.decode("utf-8"))
+    vers = sorted((v for v in idx if re.match(r"^\d+\.\d+\.\d+$", v)),
+                  key=lambda v: [int(x) for x in v.split(".")], reverse=True)
+    key = lambda v: [int(x) for x in v.split(".")]
+    if want in idx:
+        v = want
+    elif want and vers and key(want) > key(vers[0]) and "master" in idx:
+        v = "master"  # проект требует ещё не вышедший Zig — берём ночную сборку
+        info("проекту нужен Zig %s, стабильного ещё нет — беру master %s" % (want, idx["master"].get("version", "")))
+    else:
+        v = vers[0] if vers else None
+    if not v or "x86_64-linux" not in idx[v]:
+        raise Fail("не нашёл Zig %s для x86_64-linux" % (want or ""))
+    return (idx[v].get("version", v) if v == "master" else v), idx[v]["x86_64-linux"]["tarball"]
+
+
+def python_runtime(job, minor="3.13"):
+    """Переносимый CPython (python-build-standalone) для программы на Python -> путь к распакованному."""
+    rel = latest_release("astral-sh/python-build-standalone")
+    rx = r"^cpython-%s\.\d+\+\d+-x86_64-unknown-linux-gnu-install_only_stripped\.tar\.gz$" % re.escape(minor)
+    cand = pick_assets(rel["assets"] if rel else [], rx)
+    if not cand:
+        raise Fail("не нашёл python-build-standalone %s" % minor)
+    f = os.path.join(job.work, "dl", cand[0][1])
+    os.makedirs(os.path.dirname(f), exist_ok=True)
+    say("Python для программы: %s" % cand[0][1])
+    download(cand[0][2], f)
+    with tarfile.open(f) as t:
+        t.extractall(os.path.join(job.work, "pyrt"))
+    os.remove(f)
+    return os.path.join(job.work, "pyrt", "python")
+
+
+def system_env(job, src, system):
+    """Что ещё нужно сборке конкретной системы: версия Zig, свой Python."""
+    if system == "zig":
+        v, url = zig_release(src)
+        info("Zig %s" % v)
+        return ["ZIG_VERSION=" + v, "ZIG_URL=" + url]
+    if system == "python":
+        return ["PYRT=" + python_runtime(job)]
+    if system == "node":
+        return ["NODERT=" + node_runtime(job)]
+    if system == "go":
+        return ["ABE_CHROOT=" + chroot_path()]
+    return []
+
+
+def node_runtime(job):
+    """Официальный Node.js LTS (собран под glibc 2.28 — как раз Astra 1.7) -> путь к распакованному."""
+    body, _ = http_get("https://nodejs.org/dist/index.json")
+    lts = [r for r in json.loads(body.decode("utf-8")) if r.get("lts")]
+    if not lts:
+        raise Fail("не нашёл Node.js LTS")
+    v = lts[0]["version"]
+    url = "https://nodejs.org/dist/%s/node-%s-linux-x64.tar.xz" % (v, v)
+    f = os.path.join(job.work, "dl", os.path.basename(url))
+    os.makedirs(os.path.dirname(f), exist_ok=True)
+    say("Node.js для программы: %s (LTS)" % v)
+    download(url, f)
+    with tarfile.open(f) as t:
+        t.extractall(os.path.join(job.work, "nodert"))
+    os.remove(f)
+    return os.path.join(job.work, "nodert", "node-%s-linux-x64" % v)
+
+
 def prepare_build(job, src, system, repo):
     """Всё для сборки одним вызовом apt: инструменты, build-dep пакета Debian с тем же именем
     (если есть), зависимости из meson.build/CMakeLists.txt/configure.ac."""
-    tools = [[pk] for b, pk in TOOLCHAIN[system] if not os.path.exists(job.chroot + "/usr/bin/" + b)]
+    tools = [[pk] for b, pk in TOOLCHAIN[system] if not b or not os.path.exists(job.chroot + "/usr/bin/" + b)]
     pats = scan_build_deps(src, system)
     names = []
     for n in (repo.split("/")[1].lower(), default_name(repo)):
         if n not in names and re.match(r"^[a-z0-9][a-z0-9+.-]+$", n):
             names.append(n)
+    if system not in ("meson", "cmake", "autotools", "make", "qmake"):
+        names = []  # одноимённый пакет Debian для Rust/Go/Python/Node-проектов почти всегда о другом
     pre = [DEB_SRC_SH,
            'for n in %s; do if [ -n "$(apt-cache showsrc "$n" 2>/dev/null)" ]; then '
            'echo "  apt-get build-dep $n (зависимости сборки пакета Debian)"; '
@@ -1359,11 +1586,28 @@ def prepare_build(job, src, system, repo):
         info("поставлено заранее: %s" % ", ".join(sorted(set(found.values()))))
 
 
-TOOLCHAIN = {"cargo": [("cargo", "cargo")], "go": [("go", "golang-go")],
-             "meson": [("meson", "meson"), ("ninja", "ninja-build")], "cmake": [("cmake", "cmake")],
-             "autotools": [("autoreconf", "autoconf"), ("automake", "automake"), ("libtoolize", "libtool"),
-                           ("autopoint", "autopoint"), ("msgfmt", "gettext"), ("pkg-config", "pkg-config")],
-             "make": [("pkg-config", "pkg-config")]}
+# Пакеты Debian для каждой системы сборки — ставятся, только когда она встретилась.
+# Базовые (компилятор C/C++, make, cmake, meson, autotools, pkg-config) ставит install.sh.
+# Rust (rustup) и Zig скачиваются в домашнюю папку chroot при первой сборке.
+TOOLCHAIN = {
+    "cargo": [],
+    "go": [("go", "golang-go")],
+    "zig": [],
+    "stack": [("stack", "haskell-stack"), ("", "libgmp-dev"), ("", "zlib1g-dev"), ("", "libffi-dev"),
+              ("", "libncurses-dev")],
+    "cabal": [("ghc", "ghc"), ("cabal", "cabal-install"), ("", "libgmp-dev"), ("", "zlib1g-dev"),
+              ("", "libffi-dev"), ("", "libncurses-dev")],
+    "meson": [("meson", "meson"), ("ninja", "ninja-build")],
+    "cmake": [("cmake", "cmake")],
+    "autotools": [("autoreconf", "autoconf"), ("automake", "automake"), ("libtoolize", "libtool"),
+                  ("autopoint", "autopoint"), ("msgfmt", "gettext"), ("pkg-config", "pkg-config")],
+    "qmake": [("qmake6", "qmake6"), ("", "qt6-base-dev")],
+    "nim": [("nim", "nim"), ("nimble", "nimble")],
+    "dub": [("ldc2", "ldc"), ("dub", "dub")],
+    "python": [],
+    "node": [],
+    "make": [("pkg-config", "pkg-config")],
+}
 
 
 def install_source(repo, name, tag=None, prev_meta=None):
@@ -1381,13 +1625,10 @@ def install_source(repo, name, tag=None, prev_meta=None):
         version = tag or commit
         system = detect_build_system(src)
         if not system:
-            if os.path.exists(os.path.join(src, "pyproject.toml")) or os.path.exists(os.path.join(src, "setup.py")):
-                raise Fail("это программа на Python — ставьте её через pipx или uv, а не сборкой")
-            if os.path.exists(os.path.join(src, "package.json")):
-                raise Fail("это программа на Node.js — сборку npm astra-get не делает")
-            raise Fail("не понял, как собирать (нет Cargo.toml, go.mod, meson.build, CMakeLists.txt, configure, Makefile)")
+            raise Fail("не понял, как собирать. Поддерживаются: " + BUILD_SYSTEMS_TEXT)
         info("система сборки: %s" % system)
         prepare_build(job, src, system, repo)
+        extra_env = system_env(job, src, system)
         script = os.path.join(job.work, ".build.sh")
         with open(script, "w") as f:
             f.write(BUILD_SH)
@@ -1396,15 +1637,18 @@ def install_source(repo, name, tag=None, prev_meta=None):
             attempt += 1
             say("Сборка (попытка %d)" % attempt)
             blog = os.path.join(job.work, "build-%d.log" % attempt)
-            rc = run_env(["env", "SRC=" + src, "WORK=" + job.work, "NAME=" + name, "SYSTEM=" + system,
-                          "bash", script], cwd=job.work, log=blog, check=False)
+            rc = run_env(["env", "SRC=" + src, "WORK=" + job.work, "NAME=" + name, "SYSTEM=" + system]
+                         + extra_env + ["bash", script], cwd=job.work, log=blog, check=False)
             if rc == 0:
                 break
             if attempt >= MAX_BUILD_ATTEMPTS:
                 raise Fail("сборка не прошла за %d попыток (журнал: %s)" % (attempt, blog))
             text = open(blog, encoding="utf-8", errors="replace").read()
             pats = dep_patterns_from_log(text, tried)
-            groups = [] if pats else dep_groups_from_errors(text, tried)
+            groups = [] if pats or system not in C_SYSTEMS else dep_groups_from_errors(text, tried)
+            if not pats and not groups and NET_ERR.search(text):
+                raise Fail("сборке не удалось скачать зависимости из сети (проверьте интернет/прокси "
+                           "и повторите).\n%s\nЖурнал: %s" % (NET_ERR.search(text).group(0), blog))
             if not pats and not groups:
                 tail = "\n".join(text.strip().splitlines()[-8:])
                 raise Fail("сборка не удалась, а недостающих зависимостей в журнале не видно.\n%s\nЖурнал: %s"
@@ -1421,6 +1665,9 @@ def install_source(repo, name, tag=None, prev_meta=None):
             if system == "meson":
                 shutil.rmtree(os.path.join(src, "_abe"), ignore_errors=True)
         tree = os.path.join(job.work, "stage", OPT.lstrip("/"), name)
+        for alt in ("usr/local", "usr"):  # проекты, которые ставятся мимо PREFIX (qmake и др.)
+            if not os.path.isdir(tree) and os.path.isdir(os.path.join(job.work, "stage", alt, "bin")):
+                tree = os.path.join(job.work, "stage", alt)
         if not os.path.isdir(tree):
             raise Fail("после сборки не нашёл установленных файлов в %s" % tree)
         return finish_tree_install(job, tree, "github-src:" + repo, version, "", prev_meta)
@@ -1769,7 +2016,7 @@ def update_one(n, force=False):
         if rel["tag"] == m["VERSION"] and not force:
             ok("%s: уже последняя версия %s" % (n, rel["tag"]))
             return
-        cand = pick_assets(rel["assets"], m["ASSET"] or None)
+        cand = pick_assets(rel["assets"], m["ASSET"] or None, repo)
         if not cand:
             raise Fail("%s: в релизе %s нет подходящего файла" % (n, rel["tag"]))
         install_release(repo, rel, cand[0][1], cand[0][2], n, prev_meta=m, regex=m["ASSET"])
@@ -1924,7 +2171,7 @@ def cmd_resolve(a):
         r["name"] = r.get("preset") or find_by_source("github:" + val) or find_by_source("github-src:" + val) \
             or default_name(val)
         if rel:
-            cand = pick_assets(rel["assets"], a.asset)
+            cand = pick_assets(rel["assets"], a.asset, val)
             r["version"] = rel["tag"]
             r["assets"] = [{"name": c[1], "url": c[2], "score": c[0]} for c in cand]
             r["all_assets"] = [n for n, _ in rel["assets"]]
