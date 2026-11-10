@@ -346,12 +346,18 @@ class Main(QMainWindow):
         self.c_ver = QLabel("")
         self.c_asset = QComboBox()
         self.c_name = QLineEdit()
+        self.c_deps = QLineEdit()
+        self.c_deps.setPlaceholderText("необязательно, напр.: libboost-dev libncurses-dev")
+        self.c_deps.setToolTip("Пакеты Debian, которые поставить в chroot перед сборкой из исходников.\n"
+                               "Обычно не нужно: astra-get находит их сам по ошибкам сборки.\n"
+                               "Запоминаются и используются при обновлениях.")
         self.c_note = QLabel("")
         self.c_note.setWordWrap(True)
         f.addRow("Способ:", self.c_kind)
         f.addRow("Версия:", self.c_ver)
         f.addRow("Файл:", self.c_asset)
         f.addRow("Имя:", self.c_name)
+        f.addRow("Пакеты для сборки:", self.c_deps)
         f.addRow(self.c_note)
         self.c_install = QPushButton("Установить")
         self.c_install.setEnabled(False)
@@ -377,6 +383,8 @@ class Main(QMainWindow):
         self.c_asset.setEnabled(False)
         self.set_asset_row(False)
         self.c_name.setText("")
+        self.c_deps.setText("")
+        self.c_deps.setEnabled(False)
         self.c_install.setEnabled(False)
         self.c_source.setEnabled(False)
 
@@ -455,6 +463,7 @@ class Main(QMainWindow):
         self.c_note.setText("\n".join(notes))
         self.c_install.setEnabled(m in ("release", "source", "debian", "url"))
         self.c_source.setEnabled(m == "release")
+        self.c_deps.setEnabled(m in ("release", "source"))
 
     def on_install(self, source=False):
         r = self.resolved
@@ -467,6 +476,9 @@ class Main(QMainWindow):
         name = self.c_name.text().strip()
         if name:
             args += ["--name", name]
+        deps = self.c_deps.text().strip()
+        if deps and (source or r.get("method") == "source"):
+            args += ["--deps", deps]
         if source:
             args.append("--source")
         elif r.get("method") == "release" and self.c_asset.currentIndex() > 0:

@@ -111,13 +111,27 @@ astra-get track zed                              # подключить к об�
 | Nim | `*.nimble` | `nimble build` | `nim`, `nimble` |
 | D | `dub.json` / `dub.sdl` | `dub build` | `ldc`, `dub` |
 | Python | `pyproject.toml` / `setup.py` | `pip install` в собственный переносимый Python программы | python-build-standalone 3.13 |
-| Node.js | `package.json` с `bin` | `npm install`, `npm run build`, свой `node` внутри программы | `nodejs`, `npm` |
+| Node.js | `package.json` с `bin` | `npm install`, `npm run build`, свой `node` внутри программы | официальный Node.js LTS |
 
 Базовые инструменты (компилятор C/C++, make, cmake, meson, autotools, pkg-config, apt-file)
 ставит `install.sh`; всё остальное — только когда встретится проект на этом языке. Если
 программа выпущена одним бинарником без расширения (как `greenclip`), astra-get возьмёт его
 из релиза и собирать не будет. Прокси из окружения (`https_proxy` и др., например системный
 прокси Clash) передаётся и в сборку внутри chroot.
+
+**Недостающие пакеты для сборки.** Если сборка падает на отсутствующем заголовке
+(`fatal error: boost/foreach.hpp: No such file or directory`), библиотеке (`cannot find -lfoo`),
+файле pkg-config или модуле CMake, astra-get сам ищет пакет Debian с этим файлом через `apt-file`,
+ставит его в chroot и повторяет сборку. Найденные пакеты запоминаются (`DEPS` в `.update`),
+и при обновлении ставятся сразу, без повторных попыток. Если пакет найти не удалось, их можно
+указать вручную — astra-get подскажет команду поиска:
+
+```bash
+activate-build-env -- apt-file search boost/foreach.hpp     # какой пакет даёт файл
+astra-get install fph/bastet --source --deps 'libboost-dev libncurses-dev'
+```
+
+В окне `astra-get-gui` для этого есть поле «Пакеты для сборки».
 
 Что astra-get делает сам, без подсказок:
 

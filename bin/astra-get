@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -623,11 +623,12 @@ def check_name(name):
 
 def load_meta(name):
     """Читает .update (формат bash) через сам bash — надёжнее, чем разбирать кавычки."""
-    m = {"SOURCE": "", "ASSET": "", "VERSION": "", "OPTS": [], "EXTRA": []}
+    m = {"SOURCE": "", "ASSET": "", "VERSION": "", "OPTS": [], "EXTRA": [], "DEPS": []}
     f = os.path.join(app_dir(name), ".update")
     if os.path.isfile(f):
-        code = ('OPTS=(); EXTRA=(); . "$1"; printf "%s\\0" "$SOURCE" "$ASSET" "$VERSION"; '
-                'printf "%s\\0" "${#OPTS[@]}" "${OPTS[@]}" "${#EXTRA[@]}" "${EXTRA[@]}"')
+        code = ('OPTS=(); EXTRA=(); DEPS=(); . "$1"; printf "%s\\0" "$SOURCE" "$ASSET" "$VERSION"; '
+                'printf "%s\\0" "${#OPTS[@]}" "${OPTS[@]}" "${#EXTRA[@]}" "${EXTRA[@]}" '
+                '"${#DEPS[@]}" "${DEPS[@]}"')
         try:
             out = subprocess.check_output(["bash", "-c", code, "x", f]).decode("utf-8", "replace").split("\0")
             m["SOURCE"], m["ASSET"], m["VERSION"] = out[0], out[1], out[2]
@@ -635,6 +636,8 @@ def load_meta(name):
             m["OPTS"] = out[4:4 + n]
             k = int(out[4 + n])
             m["EXTRA"] = out[5 + n:5 + n + k]
+            d = int(out[5 + n + k])
+            m["DEPS"] = out[6 + n + k:6 + n + k + d]
         except (subprocess.CalledProcessError, ValueError, IndexError):
             warn("%s: не удалось прочитать %s" % (name, f))
     return m
@@ -648,6 +651,9 @@ def save_meta(name, m):
         f.write("OPTS=( %s )\n" % " ".join(q(o) for o in m.get("OPTS", [])))
         f.write("# файлы из chroot, которые кладутся в программу перед установкой\n")
         f.write("EXTRA=( %s )\n" % " ".join(q(o) for o in m.get("EXTRA", [])))
+        if m.get("DEPS"):
+            f.write("# пакеты Debian, нужные для сборки из исходников (ставятся в chroot перед сборкой)\n")
+            f.write("DEPS=( %s )\n" % " ".join(q(o) for o in m["DEPS"]))
     os.replace(os.path.join(app_dir(name), ".update.tmp"), os.path.join(app_dir(name), ".update"))
 
 
@@ -1129,7 +1135,7 @@ def default_name(repo):
     return re.sub(r"[-_](releases?|binaries|bin|linux|desktop|app)$", "", n) or n
 
 
-def install_github(repo, name=None, asset=None, source_build=False, force_name=False):
+def install_github(repo, name=None, asset=None, source_build=False, force_name=False, deps=()):
     existing = find_by_source("github:" + repo) or find_by_source("github-src:" + repo)
     name = name or existing or default_name(repo)
     if os.path.isdir(app_dir(name)) and name != existing and not force_name:
@@ -1149,13 +1155,15 @@ def install_github(repo, name=None, asset=None, source_build=False, force_name=F
         info("в релизе %s нет сборки под Linux x86_64 — соберу из исходников" % rel["tag"])
     elif not source_build:
         info("релизов нет — соберу из исходников")
-    return install_source(repo, name, rel["tag"] if rel else None)
+    return install_source(repo, name, rel["tag"] if rel else None, deps=deps)
 
 
 # --- Сборка из исходников ---------------------------------------------------------------------
 DEP_PATTERNS = [
-    (r"fatal error: ([\w./+-]+\.h): No such file", "hdr"),
-    (r"([\w./+-]+\.h): No such file or directory", "hdr"),
+    # gcc/clang: «fatal error: boost/foreach.hpp: No such file» — любые заголовки, в т.ч. C++ без
+    # расширения (<QtWidgets>); «fatal error» с «No such file» бывает только у #include.
+    (r"fatal error: ([\w./+-]+): No such file", "hdr"),
+    (r"(?:^|[\s'\"<])([\w./+-]+\.(?:h|hh|hpp|hxx|h\+\+|tcc|inl))['\">]?: No such file or directory", "hdr"),
     (r"Package '([\w.+-]+)',? (?:required by .*)?not found", "pc"),
     (r"No package '([\w.+-]+)' found", "pc"),
     (r"Package ([\w.+-]+) was not found in the pkg-config search path", "pc"),
@@ -1165,8 +1173,8 @@ DEP_PATTERNS = [
     (r"Could NOT find ([\w]+)", "cmake"),
     (r"Could not find a package configuration file provided by \"([\w]+)\"", "cmake"),
     (r"cannot find -l([\w.+-]+)", "lib"),
-    (r"Missing \(or bad\) header file: ([\w./+-]+\.h)", "hdr"),
-    (r"([\w./+-]+\.h)\s*(?:\([^)\n]*\)\s*)?(?:is required|not found|was not found)", "hdr"),
+    (r"Missing \(or bad\) header file: ([\w./+-]+\.(?:h|hh|hpp|hxx|h\+\+|tcc|inl))", "hdr"),
+    (r"([\w./+-]+\.(?:h|hh|hpp|hxx|h\+\+|tcc|inl))\s*(?:\([^)\n]*\)\s*)?(?:is required|not found|was not found)", "hdr"),
     (r"The pkg-config package '([\w.+-]+)'", "pc"),
     (r"pkg-config package ([\w.+-]+)[^\n]{0,40}(?:is required|not found)", "pc"),
     (r"(?:^|\s)([\w.+-]+): (?:command )?not found", "bin"),
@@ -1562,10 +1570,11 @@ def node_runtime(job):
     return os.path.join(job.work, "nodert", "node-%s-linux-x64" % v)
 
 
-def prepare_build(job, src, system, repo):
+def prepare_build(job, src, system, repo, deps=()):
     """Всё для сборки одним вызовом apt: инструменты, build-dep пакета Debian с тем же именем
     (если есть), зависимости из meson.build/CMakeLists.txt/configure.ac."""
     tools = [[pk] for b, pk in TOOLCHAIN[system] if not b or not os.path.exists(job.chroot + "/usr/bin/" + b)]
+    tools += [[d] for d in deps]
     pats = scan_build_deps(src, system)
     names = []
     for n in (repo.split("/")[1].lower(), default_name(repo)):
@@ -1579,7 +1588,7 @@ def prepare_build(job, src, system, repo):
            'apt-get build-dep -y -qq -o Dpkg::Use-Pty=0 "$n" > .bd.out 2>&1 || tail -n 5 .bd.out; '
            'printf "%%s\\t%%s\\n" "build-dep:$n" "$n" >> .apt-found; break; fi; done'
            % " ".join(shlex.quote(n) for n in names)]
-    say("Подготовка сборки: инструменты%s, зависимости из файлов сборки (%d)" % (
+    say("Подготовка сборки: пакеты%s, зависимости из файлов сборки (%d)" % (
         " " + " ".join(t[0] for t in tools) if tools else "", len(pats)))
     found = apt_install_for(pats, job.work, job.log, update=True, groups=tools, pre=pre)
     if found:
@@ -1610,8 +1619,24 @@ TOOLCHAIN = {
 }
 
 
-def install_source(repo, name, tag=None, prev_meta=None):
+def deps_hint(repo, text, pats=()):
+    """Подсказка для полуавтоматического режима: что искать и как передать пакеты вручную."""
+    miss = [p[0].split(":", 1)[1] for p in pats]
+    if not miss:
+        miss = list(dict.fromkeys(m.group(1) for rx, kind in DEP_PATTERNS if kind == "hdr"
+                                  for m in re.finditer(rx, text, re.M)))[:3]
+    lines = ["", "", "Если знаете, какой пакет Debian нужен, укажите его сами — запомнится и для обновлений:",
+             "  astra-get install %s --source --deps 'libfoo-dev libbar-dev'" % repo]
+    for f in miss[:3]:
+        lines.append("Найти пакет с файлом %s:  activate-build-env -- apt-file search %s" % (f, shlex.quote(f)))
+    return "\n".join(lines)
+
+
+def install_source(repo, name, tag=None, prev_meta=None, deps=()):
     job = Job(name, "source")
+    old = prev_meta or (load_meta(name) if os.path.isfile(os.path.join(app_dir(name), ".update")) else {})
+    deps = list(dict.fromkeys(list(deps) + list(old.get("DEPS", []))))
+    learned = []  # пакеты, найденные по ошибкам сборки, — запомним для обновлений
     try:
         src = os.path.join(job.work, "src")
         ref = ["--branch", tag] if tag else []
@@ -1627,7 +1652,9 @@ def install_source(repo, name, tag=None, prev_meta=None):
         if not system:
             raise Fail("не понял, как собирать. Поддерживаются: " + BUILD_SYSTEMS_TEXT)
         info("система сборки: %s" % system)
-        prepare_build(job, src, system, repo)
+        if deps:
+            info("пакеты для сборки: %s" % " ".join(deps))
+        prepare_build(job, src, system, repo, deps)
         extra_env = system_env(job, src, system)
         script = os.path.join(job.work, ".build.sh")
         with open(script, "w") as f:
@@ -1651,17 +1678,19 @@ def install_source(repo, name, tag=None, prev_meta=None):
                            "и повторите).\n%s\nЖурнал: %s" % (NET_ERR.search(text).group(0), blog))
             if not pats and not groups:
                 tail = "\n".join(text.strip().splitlines()[-8:])
-                raise Fail("сборка не удалась, а недостающих зависимостей в журнале не видно.\n%s\nЖурнал: %s"
-                           % (tail, blog))
+                raise Fail("сборка не удалась, а недостающих зависимостей в журнале не видно.\n%s\nЖурнал: %s%s"
+                           % (tail, blog, deps_hint(repo, text)))
             if pats:
                 say("Не хватает: %s" % ", ".join(p[0].split(":", 1)[1] for p in pats))
             else:
                 say("Пробую пакеты по тексту ошибки: %s" % ", ".join(g[0] for g in groups))
             found = apt_install_for(pats, job.work, job.log, update=False, groups=groups)
             if not found:  # повторять бессмысленно: поставить нечего
-                raise Fail("не нашёл пакеты для того, чего не хватает (журнал: %s)" % blog)
+                raise Fail("не нашёл пакеты для того, чего не хватает (журнал: %s)%s"
+                           % (blog, deps_hint(repo, text, pats)))
             for k, p in found.items():
                 ok("%s ← %s" % (k.split(":", 1)[1], p))
+                learned.append(p)
             if system == "meson":
                 shutil.rmtree(os.path.join(src, "_abe"), ignore_errors=True)
         tree = os.path.join(job.work, "stage", OPT.lstrip("/"), name)
@@ -1670,7 +1699,13 @@ def install_source(repo, name, tag=None, prev_meta=None):
                 tree = os.path.join(job.work, "stage", alt)
         if not os.path.isdir(tree):
             raise Fail("после сборки не нашёл установленных файлов в %s" % tree)
-        return finish_tree_install(job, tree, "github-src:" + repo, version, "", prev_meta)
+        res = finish_tree_install(job, tree, "github-src:" + repo, version, "", prev_meta)
+        all_deps = list(dict.fromkeys(deps + learned))
+        if all_deps:
+            m = load_meta(name)
+            m["DEPS"] = all_deps
+            save_meta(name, m)
+        return res
     except BaseException:
         job.cleanup(keep=True)
         raise
@@ -1908,12 +1943,16 @@ def github_search(q, limit=10):
 # --- Команды -----------------------------------------------------------------------------------
 def cmd_install(a):
     kind, val = parse_spec(a.spec)
+    deps = [d for v in a.deps for d in re.split(r"[\s,]+", v) if d]
+    for d in deps:
+        if not re.match(r"^[a-z0-9][a-z0-9+.-]+$", d):
+            raise Fail("некорректное имя пакета Debian: %r" % d)
     if a.name:
         check_name(a.name)
     if kind == "name" and preset_for(val):
         pname, src, rx = preset_for(val)
         info("известная программа: %s" % src)
-        return install_github(src.split(":", 1)[1], a.name or pname, a.asset or rx, a.source, a.force)
+        return install_github(src.split(":", 1)[1], a.name or pname, a.asset or rx, a.source, a.force, deps)
     if kind == "name":
         if chroot_candidate(chroot_path(), val) or chroot_dpkg_version(chroot_path(), val):
             kind = "debian"
@@ -1924,7 +1963,7 @@ def cmd_install(a):
                 msg += " Похожие пакеты: " + ", ".join(h["name"] for h in hits)
             raise Fail(msg + "  Поиск: astra-get search %s" % val)
     if kind == "github":
-        return install_github(val, a.name, a.asset, a.source, a.force)
+        return install_github(val, a.name, a.asset, a.source or bool(deps), a.force, deps)
     if kind == "debian":
         return install_debian(val, a.name, host_links=not a.no_host_links)
     if kind == "url":
@@ -2254,6 +2293,9 @@ def main():
     p.add_argument("--name", help="имя программы (по умолчанию из репозитория)")
     p.add_argument("--asset", help="регулярное выражение файла релиза")
     p.add_argument("--source", action="store_true", help="собрать из исходников, даже если есть релиз")
+    p.add_argument("--deps", action="append", default=[], metavar="ПАКЕТЫ",
+                   help="пакеты Debian для сборки из исходников (через пробел или запятую); "
+                        "ставятся в chroot заранее и запоминаются для обновлений")
     p.add_argument("--no-host-links", action="store_true", help="для deb: не создавать ссылки на каталоги данных")
     p.add_argument("--force", action="store_true", help="заменить программу с тем же именем из другого источника")
     p = sub.add_parser("remove", help="удалить")
