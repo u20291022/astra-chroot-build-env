@@ -14,7 +14,7 @@ try:
     from PyQt5.QtGui import QFont, QIcon
     from PyQt5.QtWidgets import (
         QAbstractItemView, QApplication, QComboBox, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
-        QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
+        QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
         QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 except ImportError:
     sys.stderr.write("Нужен PyQt5 для %s (%s): sudo apt install python3-pyqt5\n"
@@ -41,6 +41,34 @@ def source_text(src):
         if src.startswith(p):
             return t + src[len(p):]
     return src
+
+
+class ElidedLabel(QLabel):
+    """Строка состояния: длинный текст обрезается многоточием и не растягивает окно.
+    Полный текст — во всплывающей подсказке."""
+
+    def __init__(self, text=""):
+        super().__init__()
+        self.full = ""
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(50)
+        self.setText(text)
+
+    def setText(self, text):
+        self.full = text
+        self.setToolTip(text if len(text) > 60 else "")
+        self.elide()
+
+    def text(self):
+        return self.full
+
+    def elide(self):
+        line = self.full.replace("\n", " ")
+        QLabel.setText(self, self.fontMetrics().elidedText(line, Qt.ElideRight, max(self.width(), 50)))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.elide()
 
 
 class Runner:
@@ -173,7 +201,7 @@ class Main(QMainWindow):
         lay.addWidget(self.split, 1)
 
         bottom = QHBoxLayout()
-        self.status = QLabel("")
+        self.status = ElidedLabel("")
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
         self.progress.setVisible(False)
@@ -342,9 +370,12 @@ class Main(QMainWindow):
         tf.setBold(True)
         self.c_title.setFont(tf)
         f.addRow(self.c_title)
-        self.c_kind = QLabel("")
-        self.c_ver = QLabel("")
+        self.c_kind = ElidedLabel("")
+        self.c_ver = ElidedLabel("")
         self.c_asset = QComboBox()
+        # длинные имена файлов релиза не должны раздвигать окно
+        self.c_asset.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.c_asset.setMinimumContentsLength(20)
         self.c_name = QLineEdit()
         self.c_deps = QLineEdit()
         self.c_deps.setPlaceholderText("необязательно, напр.: libboost-dev libncurses-dev")
