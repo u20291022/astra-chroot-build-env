@@ -89,6 +89,7 @@ astra-get install https://github.com/sharkdp/bat
 astra-get install helix-editor/helix --name helix
 astra-get install htop-dev/htop                  # сборка из исходников
 astra-get install deb:mousepad
+astra-get install deb:keepass2                   # Mono/.NET: рантайм берётся из chroot
 astra-get search markdown                        # поиск в Debian и на GitHub
 astra-get resolve zed-industries/zed             # что будет поставлено, без установки
 astra-get list
@@ -98,6 +99,10 @@ astra-get rollback zed                           # вернуть прошлую
 astra-get remove bat
 astra-get track zed                              # подключить к обновлениям старую установку
 ```
+
+Пакеты Debian, где команда — скрипт, запускающий интерпретатор (`keepass2` → Mono,
+программы на Python), ставятся вместе с этим интерпретатором из chroot. Переходные пакеты
+(`keepassxc` → `keepassxc-full`) astra-get раскрывает сам.
 
 Системы сборки, которые astra-get узнаёт по файлам проекта:
 

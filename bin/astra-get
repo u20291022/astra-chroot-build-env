@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 HOME = os.path.expanduser("~")
 OPT = os.environ.get("BUILD_ENV_OPT", os.path.join(HOME, ".local/opt/buildenv"))
@@ -813,6 +813,9 @@ def plan_links(tree, scan, name):
             out.append("bin/" + e)
         elif os.path.isfile(os.path.join(tree, e)) and os.access(os.path.join(tree, e), os.X_OK):
             out.append(e)
+    if out and os.path.isdir(bind) and all(o.startswith("bin/") for o in out) and \
+            len([e for e in os.listdir(bind) if os.access(os.path.join(bind, e), os.X_OK)]) <= 6:
+        return []  # немного команд в bin/ (keepassxc, keepassxc-cli, keepassxc-proxy) — выводим все
     if out:
         return out
     if os.path.isdir(bind):
@@ -1074,7 +1077,13 @@ def install_release(repo, rel, asset_name, asset_url, name, prev_meta=None, rege
             os.makedirs(os.path.join(tree, "bin"), exist_ok=True)
             link = os.path.join(tree, "bin", name)
             if not os.path.lexists(link):
-                os.symlink("../AppRun", link)
+                # Не ссылка, а скрипт: AppRun от linuxdeploy ищет свои файлы рядом с $0
+                # (dirname "$0"), и через ссылку bin/NAME попадал в bin/ — «apprun-hooks: No such file».
+                with open(link, "w") as o:
+                    o.write('#!/bin/sh\nd=$(dirname "$(readlink -f "$0")")/..\n'
+                            'export APPDIR="$(cd "$d" && pwd)" ARGV0="${ARGV0:-$0}"\n'
+                            'exec "$APPDIR/AppRun" "$@"\n')
+                os.chmod(link, 0o755)
             root_desktop(tree, name, appimage=True)
         return finish_tree_install(job, tree, source or "github:" + repo, rel["tag"], regex or "", prev_meta,
                                    depends=depends)
@@ -1719,6 +1728,54 @@ HOST_LINK_SKIP = {"doc", "man", "info", "locale", "applications", "icons", "pixm
                   "vim", "nano", "apport", "bug", "debhelper", "nautilus", "kservices5", "kio"}
 
 
+def chroot_dpkg_depends(chroot, pkg):
+    """Depends установленного пакета в chroot -> [[альтернатива, ...], ...] без версий."""
+    st = chroot + "/var/lib/dpkg/status"
+    cur, dep = None, ""
+    if os.path.exists(st):
+        for line in open(st, encoding="utf-8", errors="replace"):
+            if line.startswith("Package: "):
+                if cur == pkg:
+                    break
+                cur, dep = line[9:].strip(), ""
+            elif line.startswith(("Depends: ", "Pre-Depends: ")) and cur == pkg:
+                dep += "," + line.split(":", 1)[1]
+    if cur != pkg:
+        return []
+    return [[re.sub(r"[\s(:].*", "", a.strip()) for a in g.split("|")] for g in dep.split(",") if g.strip()]
+
+
+def chroot_pkg_files(chroot, pkg):
+    for f in ("%s.list" % pkg, "%s:amd64.list" % pkg):
+        f = os.path.join(chroot, "var/lib/dpkg/info", f)
+        if os.path.exists(f):
+            return [l.strip() for l in open(f, encoding="utf-8", errors="replace") if l.strip()]
+    return None
+
+
+def has_programs(chroot, files):
+    return any(re.match(r"^/(usr/)?(s?bin|games)/[^/]+$", p) and os.path.isfile(chroot + p)
+               and os.access(chroot + p, os.X_OK) for p in files)
+
+
+def program_package(chroot, pkg, files, depth=2):
+    """Переходный/мета-пакет (keepassxc -> keepassxc-full | keepassxc-minimal): программы лежат
+    в зависимости. Возвращает (пакет, его файлы) первой установленной зависимости с программами."""
+    if depth <= 0:
+        return None
+    for alts in chroot_dpkg_depends(chroot, pkg):
+        for a in alts:
+            fl = chroot_pkg_files(chroot, a)
+            if fl is None or a.startswith("lib"):
+                continue
+            if has_programs(chroot, fl):
+                return a, fl
+            sub = program_package(chroot, a, fl, depth - 1)
+            if sub:
+                return sub
+    return None
+
+
 def chroot_dpkg_version(chroot, pkg):
     st = chroot + "/var/lib/dpkg/status"
     if not os.path.exists(st):
@@ -1783,6 +1840,11 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
         run_env(["bash", script], root=True, cwd=job.work, log=job.log)
         version = open(os.path.join(job.work, ".version")).read().strip()
         files = [l.strip() for l in open(os.path.join(job.work, ".files")) if l.strip()]
+        if not has_programs(job.chroot, files):
+            real = program_package(job.chroot, pkg, files)
+            if real:
+                info("%s — переходный пакет, программы берутся из %s" % (pkg, real[0]))
+                files = files + real[1]
         tree = os.path.join(job.work, "tree")
         os.makedirs(os.path.join(tree, "bin"))
         n_bin = 0
@@ -1799,6 +1861,10 @@ def install_debian(pkg, name=None, prev_meta=None, host_links=True):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(full, dst)
         add_alternatives(job.chroot, tree)
+        if n_bin and not any(is_elf_file(os.path.join(tree, "bin", e)) for e in os.listdir(os.path.join(tree, "bin"))):
+            rts = relocate_script_programs(job.chroot, tree)
+            if rts:
+                info("команды — скрипты; интерпретатор из chroot: %s" % ", ".join(rts))
         override = None
         if not n_bin:
             # Серверы и инструменты со своим каталогом: /usr/lib/postgresql/18/bin, /usr/libexec/...
@@ -1856,6 +1922,80 @@ def chroot_resolve(chroot, path, depth=10):
         t = os.readlink(full)
         path = t if t.startswith("/") else os.path.normpath(os.path.join(os.path.dirname(path), t))
     return path
+
+
+RT = "libexec/abe-rt"   # интерпретатор из chroot для программ-скриптов (Mono, Python…)
+
+
+def is_elf_file(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def relocate_script_programs(chroot, tree):
+    """Команды пакета — скрипты, которые запускают интерпретатор из chroot (keepass2:
+    «exec /usr/bin/cli KeePass.exe» -> Mono). Кладём ELF интерпретатора в libexec/abe-rt/bin, а
+    рядом ссылки lib/share/etc на /usr/lib, /usr/share, /etc chroot: Mono и Python ищут свои
+    библиотеки относительно своего файла. Пути в скриптах переписываем на этот интерпретатор.
+    -> список интерпретаторов."""
+    bind = os.path.join(tree, "bin")
+    rt = os.path.join(tree, RT)
+    used = []
+    for f in sorted(os.listdir(bind)):
+        fp = os.path.join(bind, f)
+        if os.path.islink(fp) or not os.path.isfile(fp) or is_elf_file(fp):
+            continue
+        try:
+            text = open(fp, encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        lines = text.split("\n")
+        shebang = None
+        m = re.match(r"#!\s*(\S+)(?:\s+(\S+))?", lines[0]) if lines else None
+        if m:
+            shebang = m.group(2) if os.path.basename(m.group(1)) == "env" and m.group(2) else m.group(1)
+            if not shebang.startswith("/"):
+                shebang = "/usr/bin/" + shebang
+        refs = set(re.findall(r"(?<![\w/.-])(/usr/s?bin/[\w.+-]+)", "\n".join(lines[1:])))
+        if shebang and os.path.basename(shebang) not in ("sh", "bash", "dash"):
+            refs.add(shebang)
+        mapping = {}
+        for r in sorted(refs):
+            real = chroot_resolve(chroot, r)
+            if not is_elf_file(chroot + real) or os.path.basename(r) in ("sh", "bash", "dash", "env"):
+                continue
+            # Имя — настоящее (mono-sgen, python3.13), а не ссылки (cli, python3): Mono угадывает
+            # свой каталог, только если файл называется mono/mono-sgen.
+            name = os.path.basename(real)
+            os.makedirs(os.path.join(rt, "bin"), exist_ok=True)
+            dst = os.path.join(rt, "bin", name)
+            if not os.path.exists(dst):
+                shutil.copy2(chroot + real, dst)
+                used.append("%s → %s" % (os.path.basename(r), name) if os.path.basename(r) != name else name)
+            mapping[r] = name
+        if not mapping:
+            continue
+        for d, target in (("lib", "/usr/lib"), ("share", "/usr/share"), ("etc", "/etc")):
+            if not os.path.lexists(os.path.join(rt, d)):
+                os.symlink(chroot + target, os.path.join(rt, d))
+        here = '"$(dirname "$(readlink -f "$0")")/../%s/bin/%s"'
+        if shebang in mapping:
+            # скрипт на Python/Perl…: тело — в libexec, в bin — обёртка на sh
+            os.makedirs(os.path.join(rt, "scripts"), exist_ok=True)
+            shutil.copy2(fp, os.path.join(rt, "scripts", f))
+            with open(fp, "w") as o:
+                o.write('#!/bin/sh\nd=$(dirname "$(readlink -f "$0")")/..\n'
+                        'exec "$d/%s/bin/%s" "$d/%s/scripts/%s" "$@"\n' % (RT, mapping[shebang], RT, f))
+        else:
+            for r, name in mapping.items():
+                text = re.sub(r"(?<![\w/.-])" + re.escape(r) + r"(?![\w.+-])", lambda _m: here % (RT, name), text)
+            with open(fp, "w") as o:
+                o.write(text)
+        os.chmod(fp, 0o755)
+    return used
 
 
 def add_alternatives(chroot, tree):
